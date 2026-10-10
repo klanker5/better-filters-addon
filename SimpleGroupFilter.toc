@@ -1,0 +1,8 @@
+## Interface: 120100
+## Title: Better Filters
+## Notes: Filters the Premade Groups (LFG) search results.
+## Author: Klanker 5
+## Version: 0.1.0
+## SavedVariables: SimpleGroupFilterDB
+
+SimpleGroupFilter.lua
