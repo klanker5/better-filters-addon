@@ -372,8 +372,13 @@ local function BuildRaidData()
         end
     end
 
+    -- on a brand-new character the Encounter Journal data may not be loaded yet:
+    -- report "nothing yet" and try again the next time the raid panel is shown
+    local numTiers = EJ_GetNumTiers()
+    if type(numTiers) ~= "number" or numTiers < 1 then return raids end
+
     local oldTier = EJ_GetCurrentTier and EJ_GetCurrentTier()
-    EJ_SelectTier(EJ_GetNumTiers())
+    EJ_SelectTier(numTiers)
 
     for index = 1, 20 do
         local instanceID, name, _, bgImage, buttonImage = EJ_GetInstanceByIndex(index, true)
@@ -400,7 +405,7 @@ local function BuildRaidData()
         end
     end
 
-    if oldTier then EJ_SelectTier(oldTier) end
+    if type(oldTier) == "number" and oldTier >= 1 then EJ_SelectTier(oldTier) end
     return raids
 end
 
@@ -2603,7 +2608,10 @@ local function BuildRaidPanel()
 
     -- (Re)builds the raid tabs and the boss buttons of the selected raid
     LayoutRaid = function()
-        if #raidData == 0 then raidData = BuildRaidData() end
+        if #raidData == 0 then
+            local ok, result = pcall(BuildRaidData)
+            if ok and result then raidData = result end
+        end
 
         for _, tab in ipairs(p.tabs) do tab:Hide() end
         for _, btn in ipairs(p.bossButtons) do btn:Hide() end
@@ -2929,12 +2937,22 @@ local function TryInit()
         return
     end
     initialized = true
-    InstallHooks()
-    InstallNoteHooks()
-    InstallSpecHooks()
-    BuildPanel()
-    BuildRaidPanel()
-    pcall(InstallRaiderIOSupport)
+
+    -- each part is set up on its own, so a problem in one cannot stop the others
+    local steps = {
+        { "hooks", InstallHooks },
+        { "note hooks", InstallNoteHooks },
+        { "spec icons", InstallSpecHooks },
+        { "dungeon panel", BuildPanel },
+        { "raid panel", BuildRaidPanel },
+        { "Raider.IO support", InstallRaiderIOSupport },
+    }
+    for _, step in ipairs(steps) do
+        local ok, err = pcall(step[2])
+        if not ok then
+            print("|cff33ff99BF:|r couldn't set up " .. step[1] .. ":", err)
+        end
+    end
 end
 
 local frame = CreateFrame("Frame")
