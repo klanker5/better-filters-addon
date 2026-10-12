@@ -32,6 +32,7 @@ local defaults = {
     raidDpsMin = 0,    raidDpsMax = RAID_DPS_MAX,
     partyFit   = false,         -- only show groups with room for my party's roles
     instantSignUp = true,       -- clicking a listing signs up straight away
+    signUpNote = "",            -- text put in the note box when you sign up to a group
     dungeons   = {},            -- [challengeMapID] = 1 (include) or 2 (exclude)
     notes      = {},            -- [leader name] = { color = "green"|"red", text = "..." }
     noteAlerts = true,          -- chat alert when a player with a note is in your group
@@ -697,6 +698,140 @@ local function MakeLabel(parent, text, x, y)
     return fs
 end
 
+-- Sign-up note box -----------------------------------------------------------
+-- Addons are not allowed to write into Blizzard's sign-up note box, so instead of
+-- filling it in we move Blizzard's own box into our panel. What you type there is
+-- what gets sent when you sign up. Outside the Dungeons and Raids panels the box
+-- goes back to its normal place in the sign-up dialog.
+local noteSlots = {}          -- the slot in each of our panels
+local noteOriginal            -- where Blizzard's box lived before we moved it
+local noteHiddenRegions = {}
+
+local function PlaceSignUpNote()
+    local desc = LFGListApplicationDialog and LFGListApplicationDialog.Description
+    if not desc then return end
+    local edit = desc.EditBox
+
+    local slot
+    for _, candidate in ipairs(noteSlots) do
+        if candidate:IsVisible() then slot = candidate break end
+    end
+
+    if slot then
+        if not noteOriginal then
+            noteOriginal = { parent = desc:GetParent(), points = {}, width = desc:GetWidth(), height = desc:GetHeight() }
+            for i = 1, desc:GetNumPoints() do
+                noteOriginal.points[i] = { desc:GetPoint(i) }
+            end
+            if edit then
+                noteOriginal.editWidth, noteOriginal.editHeight = edit:GetSize()
+                noteOriginal.maxLetters = edit:GetMaxLetters()
+            end
+        end
+        desc:SetParent(slot)
+        desc:ClearAllPoints()
+        desc:SetPoint("TOPLEFT", slot, "TOPLEFT", 0, 0)
+        desc:SetSize(slot:GetWidth(), slot:GetHeight())
+        if edit then
+            edit:SetSize(slot:GetWidth() - 8, slot:GetHeight())
+            edit:SetMaxLetters(60)
+        end
+        -- flat look: hide Blizzard's frame art, our slot draws the border
+        wipe(noteHiddenRegions)
+        for _, region in ipairs({ desc:GetRegions() }) do
+            if region.GetObjectType and region:GetObjectType() == "Texture" and region:IsShown() then
+                region:Hide()
+                noteHiddenRegions[#noteHiddenRegions + 1] = region
+            end
+        end
+        if desc.CharCount then desc.CharCount:SetAlpha(0) end
+        desc:Show()
+    elseif noteOriginal then
+        desc:SetParent(noteOriginal.parent)
+        desc:ClearAllPoints()
+        for _, pt in ipairs(noteOriginal.points) do
+            desc:SetPoint(unpack(pt))
+        end
+        desc:SetSize(noteOriginal.width, noteOriginal.height)
+        if edit and noteOriginal.editWidth then
+            edit:SetSize(noteOriginal.editWidth, noteOriginal.editHeight)
+            if noteOriginal.maxLetters then edit:SetMaxLetters(noteOriginal.maxLetters) end
+        end
+        for _, region in ipairs(noteHiddenRegions) do region:Show() end
+        wipe(noteHiddenRegions)
+        if desc.CharCount then desc.CharCount:SetAlpha(1) end
+    end
+end
+
+-- Each panel registers a function that pulls everything under the note box up when the
+-- box is not there (so no blank row is left behind).
+local noteCollapsers = {}
+local instantChecks = {}      -- the Instant sign up button of each panel (kept in step)
+
+-- owner: the panel; slotY: the y of the note box in it; shift: how far to pull things up;
+-- extra(collapsed): anything else the panel needs to do (optional)
+local function BuildNoteCollapser(owner, slotY, shift, extra)
+    local items = {}
+    local function Collect(obj)
+        local n = obj:GetNumPoints()
+        if n == 0 then return end
+        local pts = {}
+        for i = 1, n do
+            local point, rel, relPoint, x, y = obj:GetPoint(i)
+            if rel ~= owner or not y or y >= slotY - 2 then return end   -- not below the box
+            pts[i] = { point, rel, relPoint, x or 0, y }
+        end
+        items[#items + 1] = { obj = obj, pts = pts }
+    end
+    for _, child in ipairs({ owner:GetChildren() }) do Collect(child) end
+    for _, region in ipairs({ owner:GetRegions() }) do Collect(region) end
+
+    local function Apply(collapsed)
+        for _, item in ipairs(items) do
+            item.obj:ClearAllPoints()
+            for _, pt in ipairs(item.pts) do
+                item.obj:SetPoint(pt[1], pt[2], pt[3], pt[4], pt[5] + (collapsed and shift or 0))
+            end
+        end
+        if extra then extra(collapsed) end
+    end
+    noteCollapsers[#noteCollapsers + 1] = Apply
+    return Apply
+end
+
+-- the note box only lives in our panels while Instant sign up is on
+local function UpdateNoteSlots()
+    for _, slot in ipairs(noteSlots) do
+        slot:SetShown(db and db.instantSignUp and true or false)
+    end
+    local collapsed = not (db and db.instantSignUp)
+    for _, apply in ipairs(noteCollapsers) do pcall(apply, collapsed) end
+    for _, check in ipairs(instantChecks) do
+        if check.Refresh then check:Refresh() end
+    end
+    pcall(PlaceSignUpNote)
+end
+
+local function MakeSignUpNoteBox(parent, x, y, width)
+    local slot = CreateFrame("Frame", nil, parent)
+    slot:SetSize(width, 22)
+    slot:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
+
+    local edge = slot:CreateTexture(nil, "BACKGROUND", nil, -2)
+    edge:SetPoint("TOPLEFT", -1, 1)
+    edge:SetPoint("BOTTOMRIGHT", 1, -1)
+    edge:SetColorTexture(unpack(THEME.border))
+    local bg = slot:CreateTexture(nil, "BACKGROUND", nil, -1)
+    bg:SetAllPoints()
+    bg:SetColorTexture(unpack(THEME.field))
+
+    slot:SetShown(db and db.instantSignUp and true or false)
+    slot:SetScript("OnShow", function() pcall(PlaceSignUpNote) end)
+    slot:SetScript("OnHide", function() C_Timer.After(0, function() pcall(PlaceSignUpNote) end) end)
+    noteSlots[#noteSlots + 1] = slot
+    return slot
+end
+
 -- Toggle buttons -------------------------------------------------------------
 -- A flat button that changes colour with its state:
 --   "off" = grey, "yes" = green, "no" = red
@@ -749,6 +884,7 @@ local function MakeCheck(parent, text, x, y, key, width)
         Apply()
         RefreshList()
     end)
+    b.Refresh = Apply
     Apply()
     return b
 end
@@ -2131,6 +2267,12 @@ local function BuildPanel()
         GameTooltip:Show()
     end)
     instantCheck:SetScript("OnLeave", GameTooltip_Hide)
+    instantCheck:HookScript("OnClick", UpdateNoteSlots)
+    instantChecks[#instantChecks + 1] = instantCheck
+    y = y - ROW_STEP
+
+    local noteY = y
+    MakeSignUpNoteBox(panel, LEFT, y, WIDTH)
     y = y - ROW_H - SECTION
 
     -- Playstyle -------------------------------------------------------------
@@ -2213,7 +2355,20 @@ local function BuildPanel()
     BuildDungeonButtons()
     y = y - 2 * 44 - DUNGEON_GAP    -- two rows of 44px icons with one gap between
 
-    panel:SetHeight(-y + 14)
+    local baseHeight = -y + 14
+    local baseGridTop = dungeonGridTop
+    panel:SetHeight(baseHeight)
+    BuildNoteCollapser(panel, noteY, ROW_STEP, function(collapsed)
+        panel:SetHeight(baseHeight - (collapsed and ROW_STEP or 0))
+        -- dungeon icons can be created later too, so place them from the grid position
+        dungeonGridTop = baseGridTop + (collapsed and ROW_STEP or 0)
+        for i, b in ipairs(dungeonButtons) do
+            b:ClearAllPoints()
+            b:SetPoint("TOPLEFT", panel, "TOPLEFT",
+                dungeonGridLeft + ((i - 1) % 4) * (44 + DUNGEON_GAP),
+                dungeonGridTop - math.floor((i - 1) / 4) * (44 + DUNGEON_GAP))
+        end
+    end)(not db.instantSignUp)
 
     -- Only show the panel while the Premade Groups search list is open AND it is
     -- searching the Dungeons category (not raids, arenas and so on) ---------
@@ -2303,6 +2458,12 @@ local function BuildRaidPanel()
         GameTooltip:Show()
     end)
     instantCheck:SetScript("OnLeave", GameTooltip_Hide)
+    instantCheck:HookScript("OnClick", UpdateNoteSlots)
+    instantChecks[#instantChecks + 1] = instantCheck
+    y = y - ROW_STEP
+
+    local noteY = y
+    MakeSignUpNoteBox(p, LEFT, y, WIDTH)
     y = y - ROW_H - SECTION
 
     -- Playstyle (its own settings, separate from the dungeon panel) -------------------
@@ -2379,6 +2540,7 @@ local function BuildRaidPanel()
 
     -- boss buttons ------------------------------------------------------------------------------
     local LayoutRaid   -- defined below
+    local noteShift = 0   -- how far the tabs and boss buttons are pulled up (note box not shown)
 
     local function ApplyBoss(btn)
         local state = db.raidBosses[btn.key]
@@ -2463,7 +2625,7 @@ local function BuildRaidPanel()
             tab:SetWidth(tabWidth)
             tab.text:SetWidth(tabWidth - 8)
             tab:ClearAllPoints()
-            tab:SetPoint("TOPLEFT", p, "TOPLEFT", LEFT + (i - 1) * (tabWidth + gap), tabsY)
+            tab:SetPoint("TOPLEFT", p, "TOPLEFT", LEFT + (i - 1) * (tabWidth + gap), tabsY + noteShift)
             tab:SetState(raid == selected and "sel" or "off", Abbreviate(raid.name))
             if raid.image then
                 tab.art:SetTexture(raid.image)
@@ -2487,7 +2649,7 @@ local function BuildRaidPanel()
             local col = (i - 1) % 2
             local row = math.floor((i - 1) / 2)
             btn:ClearAllPoints()
-            btn:SetPoint("TOPLEFT", p, "TOPLEFT", col == 0 and LEFT or COL2, bossY - row * ROW_STEP)
+            btn:SetPoint("TOPLEFT", p, "TOPLEFT", col == 0 and LEFT or COL2, bossY + noteShift - row * ROW_STEP)
             ApplyBoss(btn)
             btn:Show()
         end
@@ -2499,7 +2661,7 @@ local function BuildRaidPanel()
         end
         noBosses:SetShown(bossCount == 0)
         local bossRows = math.max(1, math.ceil(bossCount / 2))
-        p:SetHeight(-(bossY - (bossRows - 1) * ROW_STEP - ROW_H) + 14)
+        p:SetHeight(-(bossY + noteShift - (bossRows - 1) * ROW_STEP - ROW_H) + 14)
     end
 
     clear:SetScript("OnClick", function()
@@ -2507,6 +2669,12 @@ local function BuildRaidPanel()
         LayoutRaid()
         RefreshList()
     end)
+
+    -- pull everything up when the sign-up note box is not in this panel
+    BuildNoteCollapser(p, noteY, ROW_STEP, function(collapsed)
+        noteShift = collapsed and ROW_STEP or 0
+        if p:IsShown() then LayoutRaid() end
+    end)(not db.instantSignUp)
 
     -- Only show this panel while the Premade Groups list is searching Raids ------------------
     local searchPanel = LFGListFrame.SearchPanel
@@ -2669,6 +2837,92 @@ end
 
 -- The LFG UI might not exist yet when our addon loads, so we try on several
 -- events and stop as soon as it works.
+---------------------------------------------------------------------------
+-- Raider.IO: keep its side panel to the right of ours
+---------------------------------------------------------------------------
+-- Raider.IO hangs its panel on a tiny 16x16 frame that is attached to the right edge of
+-- the Group Finder window, which is where our panel goes. While one of our panels is
+-- showing, that one frame (and nothing else) is attached to our panel instead.
+
+local placingRaiderIO = false
+
+-- the panel of ours that is showing, if any
+local function ShownPanel()
+    if panel and panel:IsShown() then return panel end
+    if raidPanel and raidPanel:IsShown() then return raidPanel end
+end
+
+local function PlaceRaiderIO()
+    local anchor = _G.RaiderIO_ProfileTooltipAnchor
+    local window = PVEFrame or LFGListFrame
+    if not (anchor and anchor.SetPoint and window) then return end
+
+    local target
+    if panel and panel:IsShown() then
+        target = panel
+    elseif raidPanel and raidPanel:IsShown() then
+        target = raidPanel
+    end
+
+    placingRaiderIO = true
+    anchor:ClearAllPoints()
+    if target then
+        -- its panel starts at the anchor's right edge, which is 16 pixels wide
+        anchor:SetPoint("TOPLEFT", target, "TOPRIGHT", 4 - 16, 0)
+    else
+        anchor:SetPoint("TOPLEFT", window, "TOPRIGHT", -16, 0)   -- where Raider.IO puts it
+    end
+    placingRaiderIO = false
+end
+
+local function InstallRaiderIOSupport()
+    local function Update() pcall(PlaceRaiderIO) end
+
+    for _, f in ipairs({ panel, raidPanel }) do
+        if f then
+            f:HookScript("OnShow", Update)
+            f:HookScript("OnHide", Update)
+        end
+    end
+    LFGListFrame:HookScript("OnShow", function()
+        Update()
+        -- Raider.IO may build or reposition its frames a moment later
+        C_Timer.After(0.5, Update)
+        C_Timer.After(2, Update)
+    end)
+
+    -- Raider.IO moves the anchor again whenever any tooltip shows (hovering one of our
+    -- buttons, for instance): put it back straight after it does
+    local function HookAnchor()
+        local anchor = _G.RaiderIO_ProfileTooltipAnchor
+        if anchor and not anchor.BetterFiltersHooked then
+            anchor.BetterFiltersHooked = true
+            hooksecurefunc(anchor, "SetPoint", function(_, _, relativeTo)
+                if placingRaiderIO then return end
+                local target = ShownPanel()
+                if target and relativeTo ~= target then
+                    pcall(PlaceRaiderIO)
+                end
+            end)
+        end
+    end
+    HookAnchor()
+    C_Timer.After(2, HookAnchor)
+    LFGListFrame:HookScript("OnShow", HookAnchor)
+
+    local function HookTooltip()
+        local tip = _G.RaiderIO_ProfileTooltip
+        if tip and tip.HookScript and not tip.BetterFiltersHooked then
+            tip.BetterFiltersHooked = true
+            tip:HookScript("OnShow", Update)
+        end
+    end
+    HookTooltip()
+    C_Timer.After(2, HookTooltip)
+    LFGListFrame:HookScript("OnShow", HookTooltip)
+    Update()
+end
+
 local function TryInit()
     if initialized or not db then return end
     if not (LFGListFrame and LFGListFrame.SearchPanel and LFGListSearchPanel_UpdateResultList) then
@@ -2680,6 +2934,7 @@ local function TryInit()
     InstallSpecHooks()
     BuildPanel()
     BuildRaidPanel()
+    pcall(InstallRaiderIOSupport)
 end
 
 local frame = CreateFrame("Frame")
