@@ -87,6 +87,23 @@ local function usable(v)
     return true
 end
 
+-- One member of a listing: role ("TANK"/"HEALER"/"DAMAGER"), class file ("WARRIOR") and
+-- localized spec name. The game replaced GetSearchResultMemberInfo with
+-- GetSearchResultPlayerInfo (which returns a table), so both are supported.
+local function GetMember(resultID, index)
+    if C_LFGList.GetSearchResultPlayerInfo then
+        local t = C_LFGList.GetSearchResultPlayerInfo(resultID, index)
+        if type(t) == "table" then
+            return t.assignedRole, t.classFilename, t.specName, t
+        end
+        return nil
+    end
+    if C_LFGList.GetSearchResultMemberInfo then
+        local role, classFile, _, specName = C_LFGList.GetSearchResultMemberInfo(resultID, index)
+        return role, classFile, specName
+    end
+end
+
 -- lowercase, strip apostrophes, punctuation and spaces:
 -- "Magisters' Terrace" -> "magistersterrace"
 local function Normalize(s)
@@ -242,7 +259,7 @@ local function MatchesBloodlust(resultID, info)
 
     local sawAnyClass, has = false, false
     for i = 1, n do
-        local _, classFile = C_LFGList.GetSearchResultMemberInfo(resultID, i)
+        local _, classFile = GetMember(resultID, i)
         if usable(classFile) then
             sawAnyClass = true
             if BLOODLUST_CLASSES[classFile] then
@@ -1240,7 +1257,7 @@ local function UpdateSpecIcons(entry)
         local byRole = { TANK = {}, HEALER = {}, DAMAGER = {} }
         local ok = true
         for i = 1, numMembers do
-            local role, classFile, _, specName = C_LFGList.GetSearchResultMemberInfo(resultID, i)
+            local role, classFile, specName = GetMember(resultID, i)
             if not (usable(role) and usable(classFile) and usable(specName))
                 or type(classFile) ~= "string" or type(specName) ~= "string" or not byRole[role] then
                 ok = false break
@@ -1456,11 +1473,94 @@ local function UpdateRaidComp(entry)
     fs:Show()
 end
 
+-- Raids: how many players of your own class are already in each group, shown on the
+-- playstyle line as "[class icon] 3", under the tank / healer / dps numbers
+-- Midnight tier tokens are shared by armor type
+local TIER_TOKEN = {
+    MAGE = "Woven", PRIEST = "Woven", WARLOCK = "Woven",
+    DEMONHUNTER = "Cured", DRUID = "Cured", MONK = "Cured", ROGUE = "Cured",
+    EVOKER = "Cast", HUNTER = "Cast", SHAMAN = "Cast",
+    DEATHKNIGHT = "Forged", PALADIN = "Forged", WARRIOR = "Forged",
+}
+
+local function UpdateRaidClassCount(entry)
+    local fs = entry.SGFClassCount
+    local function Off()
+        if fs then fs:Hide() end
+    end
+
+    local dd = entry.DataDisplay
+    local searchPanel = LFGListFrame and LFGListFrame.SearchPanel
+    local isRaid = searchPanel and searchPanel.categoryID == RAID_CATEGORY_ID
+
+    -- Blizzard's tank / healer / dps numbers sit a little higher on raid rows, to leave
+    -- room for our line under them (and go back to normal in other categories)
+    if dd and dd.GetNumPoints and dd:GetNumPoints() == 1 or entry.SGFDDOrig then
+        if isRaid and not entry.SGFDDOrig then
+            local point, rel, relPoint, x, y = dd:GetPoint(1)
+            if point then entry.SGFDDOrig = { point, rel, relPoint, x or 0, y or 0 } end
+        end
+        local o = entry.SGFDDOrig
+        if o then
+            dd:ClearAllPoints()
+            dd:SetPoint(o[1], o[2], o[3], o[4], o[5] + (isRaid and 7 or 0))
+        end
+    end
+
+    if not db or not dd or not isRaid then return Off() end
+    local resultID = entry.resultID
+    if not resultID or not usable(resultID) then return Off() end
+
+    local info = C_LFGList.GetSearchResultInfo(resultID)
+    if not info or not usable(info.numMembers) or type(info.numMembers) ~= "number" then return Off() end
+
+    local myClass = UnitClassBase and UnitClassBase("player")
+    if not myClass then return Off() end
+
+    local myToken = TIER_TOKEN[myClass]
+    local count, tokenCount = 0, 0
+    for i = 1, info.numMembers do
+        local _, classFile = GetMember(resultID, i)
+        if not usable(classFile) or type(classFile) ~= "string" then return Off() end   -- can't read: show nothing
+        if classFile == myClass then count = count + 1 end
+        if myToken and TIER_TOKEN[classFile] == myToken then tokenCount = tokenCount + 1 end
+    end
+
+    local lineY = PlaystyleLineOffset(entry)
+    if not (lineY and entry:GetLeft()) then return Off() end
+
+    if not fs then
+        fs = entry:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        entry.SGFClassCount = fs
+    end
+    local color = RAID_CLASS_COLORS and RAID_CLASS_COLORS[myClass]
+    local hex = (count > 0 and color and color.colorStr) and color.colorStr or "ff808080"
+    local text = ("|A:classicon-%s:14:14|a |c%s%d|r"):format(myClass:lower(), hex, count)
+    if myToken then
+        -- players on the same tier token (your class included), then your own class
+        text = ("|cffffd100Tier|r |cffffffff%d|r   "):format(tokenCount) .. text
+    end
+    fs:SetText(text)
+    fs:ClearAllPoints()
+    local comp = entry.SGFRaidComp
+    if not dd:IsShown() and comp and comp:IsShown() then
+        -- applied row: the role counts we draw sit on this line, so go just left of them
+        fs:SetPoint("RIGHT", comp, "LEFT", -10, 0)
+    else
+        -- centred under Blizzard's tank / healer / dps numbers
+        local centerX = dd:GetCenter()
+        if not (centerX and usable(centerX)) then return Off() end
+        fs:SetPoint("CENTER", entry, "LEFT", centerX - entry:GetLeft() + 14, lineY)
+    end
+    fs:Show()
+end
+
 local function InstallSpecHooks()
     if LFGListSearchEntry_Update then
         hooksecurefunc("LFGListSearchEntry_Update", function(entry)
             pcall(UpdateSpecIcons, entry)
             pcall(UpdateRaidComp, entry)
+            pcall(UpdateRaidClassCount, entry)
         end)
     end
 end
@@ -2773,10 +2873,14 @@ local function DebugSpec()
         if info then
             Say("--- result", i, "| members:", Describe(info.numMembers))
             for m = 1, usable(info.numMembers) and info.numMembers or 0 do
-                local r1, r2, r3, r4, r5, r6 = C_LFGList.GetSearchResultMemberInfo(all[i], m)
-                Say("member", m, "->", Describe(r1), "|", Describe(r2), "|", Describe(r3), "|", Describe(r4), "|", Describe(r5), "|", Describe(r6))
-                if usable(r2) and usable(r4) and type(r2) == "string" and type(r4) == "string" then
-                    Say("   spec icon:", SpecIconFor(r2, r4) or "NOT FOUND")
+                local role, classFile, specName, raw = GetMember(all[i], m)
+                Say("member", m, "->", Describe(role), "|", Describe(classFile), "|", Describe(specName))
+                if type(raw) == "table" then
+                    Say("   raw fields:", Describe(raw.className), "|", Describe(raw.classFilename), "|",
+                        Describe(raw.specName), "|", Describe(raw.assignedRole))
+                end
+                if usable(classFile) and usable(specName) and type(classFile) == "string" and type(specName) == "string" then
+                    Say("   spec icon:", SpecIconFor(classFile, specName) or "NOT FOUND")
                 end
             end
         end
