@@ -2307,6 +2307,79 @@ end
 -- The panel
 ---------------------------------------------------------------------------
 
+---------------------------------------------------------------------------
+-- Your keystone: a button that shows it and lists it as a group
+---------------------------------------------------------------------------
+
+local keyButton
+
+-- { activityID, level, name } for the keystone your character holds, or nil
+local function GetOwnedKey()
+    if not (C_LFGList and C_LFGList.GetOwnedKeystoneActivityAndGroupAndLevel) then return nil end
+    local activityID, _, level = C_LFGList.GetOwnedKeystoneActivityAndGroupAndLevel(false)
+    if not usable(activityID) or not usable(level) or not activityID or not level then return nil end
+    local info = C_LFGList.GetActivityInfoTable(activityID)
+    local name = info and usable(info.fullName) and info.fullName or nil
+    if name then name = name:gsub("%s*%b()", ""):gsub("%s+$", "") end
+    return { activityID = activityID, level = level, name = name or "Keystone" }
+end
+
+local function UpdateKeyButton()
+    if not keyButton then return end
+    local key = GetOwnedKey()
+    keyButton.key = key
+    if key then
+        keyButton:SetState("off", ("+%d  %s"):format(key.level, Abbreviate(key.name)))
+    else
+        keyButton:SetState("off", "No keystone")
+    end
+end
+
+-- Opens the Group Finder's own "Start a Group" page with your key's dungeon
+-- selected. (A listing needs a title from Blizzard's own page, which addons
+-- can't fill in, so you press List Group there yourself.)
+local function KeyStep(label, fn)
+    local ok, err = pcall(fn)
+    if not ok then
+        print("|cff33ff99BF:|r key button step '" .. label .. "' failed: " .. tostring(err))
+    end
+    return ok
+end
+
+local function ListKey()
+    local key = GetOwnedKey()
+    if not key then
+        print("|cff33ff99BF:|r you don't have a keystone to list.")
+        return
+    end
+    if C_LFGList.HasActiveEntryInfo and C_LFGList.HasActiveEntryInfo() then
+        print("|cff33ff99BF:|r you already have a listing up; delist it first.")
+        return
+    end
+    local _, groupID = C_LFGList.GetOwnedKeystoneActivityAndGroupAndLevel(false)
+    if not usable(groupID) then groupID = 0 end
+
+    KeyStep("open window", function()
+        if PVEFrame and not PVEFrame:IsShown() then PVEFrame_ToggleFrame() end
+    end)
+    KeyStep("premade tab", function()
+        if GroupFinderFrameGroupButton3 then
+            GroupFinderFrameGroupButton3:Click()
+        else
+            PVEFrame_ShowFrame("GroupFinderFrame")
+        end
+    end)
+    -- press the game's own buttons instead of calling its functions, which
+    -- the game blocks when an addon does it
+    KeyStep("dungeons category", function()
+        local cs = LFGListFrame.CategorySelection
+        for _, btn in pairs(cs.CategoryButtons or {}) do
+            if btn.categoryID == 2 and btn:IsShown() then btn:Click() break end
+        end
+        cs.StartGroupButton:Click()
+    end)
+end
+
 local function BuildPanel()
     local parent = LFGListFrame
     local anchor = PVEFrame or LFGListFrame
@@ -2459,6 +2532,21 @@ local function BuildPanel()
     dungeonGridLeft = LEFT
     BuildDungeonButtons()
     y = y - 2 * 44 - DUNGEON_GAP    -- two rows of 44px icons with one gap between
+
+    -- your keystone ----------------------------------------------------------
+    y = y - 4
+    keyButton = MakeToggleButton(panel, LEFT, y, WIDTH)
+    keyButton:SetHeight(28)
+    keyButton:SetScript("OnClick", ListKey)
+    keyButton:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Your keystone")
+        GameTooltip:AddLine("Click to open the listing page with your key's dungeon selected.", 1, 1, 1, true)
+        GameTooltip:Show()
+    end)
+    keyButton:SetScript("OnLeave", GameTooltip_Hide)
+    UpdateKeyButton()
+    y = y - 28
 
     local baseHeight = -y + 14
     local baseGridTop = dungeonGridTop
@@ -3111,6 +3199,7 @@ frame:RegisterEvent("GROUP_ROSTER_UPDATE")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 frame:RegisterEvent("PLAYER_ROLES_ASSIGNED")
 frame:RegisterEvent("ACTIVE_PLAYER_SPECIALIZATION_CHANGED")
+frame:RegisterEvent("BAG_UPDATE_DELAYED")
 frame:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" then
         if arg1 == ADDON_NAME then InitDB() end
@@ -3122,6 +3211,9 @@ frame:SetScript("OnEvent", function(self, event, arg1)
         end
     elseif event == "CHALLENGE_MODE_MAPS_UPDATE" then
         BuildDungeonButtons()
+        pcall(UpdateKeyButton)
+    elseif event == "BAG_UPDATE_DELAYED" then
+        pcall(UpdateKeyButton)
     elseif event == "PLAYER_ENTERING_WORLD" then
         -- after logging in or zooming: just remember who is already in the group
         C_Timer.After(3, function() pcall(CheckGroupNotes, true) end)
