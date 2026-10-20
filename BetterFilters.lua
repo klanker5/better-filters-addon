@@ -3035,6 +3035,49 @@ local function InstallRaiderIOSupport()
     Update()
 end
 
+---------------------------------------------------------------------------
+-- Listing tooltips above Raider.IO's panel
+---------------------------------------------------------------------------
+-- The tooltip of a listing opens to the right of the Group Finder window, on top of the
+-- panels we and Raider.IO put there. Raider.IO's panel was drawn over it, hiding part of
+-- the text, so the tooltip is raised above that panel while a listing is hovered.
+
+local function RaiseListingTooltip()
+    local other = _G.RaiderIO_ProfileTooltip
+    if not GameTooltip then return end
+
+    -- put the tooltip right after the last panel on that side, so nothing can cover it
+    local after
+    if other and other.IsShown and other:IsShown() and other:GetRight() and usable(other:GetRight()) then
+        after = other
+    elseif panel and panel:IsShown() then
+        after = panel
+    elseif raidPanel and raidPanel:IsShown() then
+        after = raidPanel
+    end
+    if after and GameTooltip:IsShown() then
+        GameTooltip:ClearAllPoints()
+        GameTooltip:SetPoint("TOPLEFT", after, "TOPRIGHT", 6, 0)
+    end
+
+    -- and keep it above Raider.IO's panel in case it still overlaps
+    if other and other.GetFrameLevel then
+        local strata, level = other:GetFrameStrata(), other:GetFrameLevel()
+        if type(level) == "number" and strata then
+            GameTooltip:SetFrameStrata(strata)
+            GameTooltip:SetFrameLevel(level + 10)
+        end
+    end
+end
+
+local function InstallTooltipFix()
+    if LFGListSearchEntry_OnEnter then
+        hooksecurefunc("LFGListSearchEntry_OnEnter", function()
+            pcall(RaiseListingTooltip)
+        end)
+    end
+end
+
 local function TryInit()
     if initialized or not db then return end
     if not (LFGListFrame and LFGListFrame.SearchPanel and LFGListSearchPanel_UpdateResultList) then
@@ -3050,6 +3093,7 @@ local function TryInit()
         { "dungeon panel", BuildPanel },
         { "raid panel", BuildRaidPanel },
         { "Raider.IO support", InstallRaiderIOSupport },
+        { "tooltip fix", InstallTooltipFix },
     }
     for _, step in ipairs(steps) do
         local ok, err = pcall(step[2])
