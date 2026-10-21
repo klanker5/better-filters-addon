@@ -1,6 +1,8 @@
 # Better Filters
 
-A World of Warcraft (Retail) addon that adds a clean, flat filter panel next to the **Premade Groups** (Group Finder) window, with separate panels for **Dungeons** and **Raids**. It also adds instant sign-up, per-player notes with chat alerts, spec icons on dungeon listings, and a tidier layout for groups you have applied to.
+A World of Warcraft (Retail) addon that adds clean, flat filter panels next to the **Premade Groups** (Group Finder) window. There are panels for finding **Dungeon** and **Raid** groups, and separate panels for filtering the **applicants to your own listing**. It also adds instant sign-up, a sign-up note box, per-player notes with chat alerts, spec icons, a keystone button, and a tidier layout for groups you have applied to.
+
+> Interface version: `120005` · Addon version: `0.8.0` · Saved variables: `BetterFiltersDB`
 
 ---
 
@@ -11,9 +13,11 @@ A World of Warcraft (Retail) addon that adds a clean, flat filter panel next to 
 - [How the filters work](#how-the-filters-work)
 - [Dungeons panel](#dungeons-panel)
 - [Raids panel](#raids-panel)
+- [Applicant filters (your own listing)](#applicant-filters-your-own-listing)
 - [Notes](#notes)
 - [Applied-group display](#applied-group-display)
 - [Slash commands](#slash-commands)
+- [Saved data and upgrading from Simple Group Filter](#saved-data-and-upgrading-from-simple-group-filter)
 - [Limitations](#limitations)
 - [Troubleshooting](#troubleshooting)
 - [Project layout](#project-layout)
@@ -28,7 +32,10 @@ A World of Warcraft (Retail) addon that adds a clean, flat filter panel next to 
 - **Filter enabled** master switch.
 - **Instant sign up**: click a listing and you sign up straight away (hold Shift, Ctrl or Alt to only select it). On by default, can be switched off.
 - **Playstyle** filter (Learning, Relaxed, Competitive, Carry Offered) with three states per button.
+- **Sign-up note box**: type the note you send when signing up, right in the panel (it sits under Instant sign up).
 - **Notes**: right-click a group or player to add a good or bad note, with chat alerts when noted players join your group.
+- **Applicant filters** for your own listing, with a separate panel for dungeons and for raids.
+- Works next to **Raider.IO**: its side panel moves to the right of ours.
 - Flat, ElvUI-style look that matches Blizzard's Group Finder.
 
 **Dungeons**
@@ -38,19 +45,28 @@ A World of Warcraft (Retail) addon that adds a clean, flat filter panel next to 
 - Group composition: Has Tank, Has Healer, Has Bloodlust class.
 - Quick dungeon buttons, sorted alphabetically with readable abbreviations.
 - **Spec icons** in place of Blizzard's class-coloured role icons.
+- **Keystone button**: shows your key and opens the listing page for it.
 
 **Raids**
 - Difficulty buttons (Normal, Heroic, Mythic).
 - Range sliders for the number of tanks, healers and DPS in a group.
-- Raid tabs with artwork; selecting a raid filters to it.
+- Raid tabs with abbreviations and artwork; selecting a raid filters to it.
 - Per-boss filters: still alive or already killed.
 - Role counts shown on raid listings you have applied to.
+- On raid listings: how many players of **your class** and of **your tier token group** are in the group.
 
 ---
 
 ## Installation
 
-Go through WoWUp or Wago : https://addons.wago.io/addons/better-filters-addon
+1. Download this repository (green **Code** button, then **Download ZIP**) or clone it.
+2. Make sure the folder is named exactly **`BetterFilters`** and contains `BetterFilters.toc` and `BetterFilters.lua`.
+3. Copy the folder to your AddOns directory:
+   - Windows: `C:\Program Files (x86)\World of Warcraft\_retail_\Interface\AddOns\`
+   - macOS: `/Applications/World of Warcraft/_retail_/Interface/AddOns/`
+4. Start the game, or type `/reload` if it is already running.
+5. Make sure **Better Filters** is ticked in the AddOns list on the character-select screen.
+6. Open the Group Finder (default key `I`), go to **Premade Groups**, pick **Dungeons** or **Raids**, and the panel appears to the right of the window.
 
 If the game says the addon is out of date, tick **Load out of date AddOns** on the AddOns screen.
 
@@ -80,6 +96,7 @@ Filters apply on top of whatever search Blizzard's own box has returned. Changin
 - **Notes**: opens the notes list (the button turns green while that list is open). See [Notes](#notes).
 - **Fit my party**: reads your current group and hides groups that already have the roles you bring. A tank in your party hides groups with a tank, and so on for healers and DPS.
 - **Instant sign up**: see above.
+- **Sign-up note box**: shown under Instant sign up while it is on. What you type is sent as your note when you sign up. When Instant sign up is off the box goes back to Blizzard's sign-up dialog and the row disappears.
 
 ### Playstyle
 Buttons for each playstyle the game uses. Excluded playstyles read "No ...".
@@ -106,6 +123,11 @@ Three tri-state buttons:
 - Abbreviations are the first letter of each word (for example *Den of Nalorak* is DON), with hand-set overrides for a few names such as Void Scar Arena (VSA).
 - Same three-state cycle: include, exclude, reset.
 
+### Keystone button
+The button at the bottom of the panel shows the keystone your character holds, for example `+12 BV`, using the same short dungeon names as the dungeon icons. Click it to open the Group Finder on the Dungeons **Start a Group** page. You then pick the dungeon, a playstyle and a title and press **List Group** yourself.
+
+> The game does not let addons fill in a listing title or press List Group, so a one-click listing is not possible.
+
 ### Spec icons
 Dungeon listings show each member's **spec icon** instead of the class-coloured tank/healer/DPS icons, ordered tanks, healers, then DPS, with small grey dots for open slots. If the game does not expose a member's class or spec, that listing keeps Blizzard's default icons.
 
@@ -130,6 +152,52 @@ Three range sliders set the minimum and maximum number of **tanks**, **healers**
 - **Clear** resets all boss filters.
 
 Boss names and the raid list come from the in-game Encounter Journal, so they update with the game.
+
+### Class and tier counts on listings
+Under the tank/healer/DPS numbers of a raid listing, two counts show how many players in that raid share **your class** and **your tier set token group** (Woven, Cured, Cast/Tier or Forged, by armour type).
+
+---
+
+## Applicant filters (your own listing)
+
+When you list your own group and open the applicant list, a **Better Filters** panel appears next to the window (the dungeon version for dungeon listings, the raid version for raid listings). It hides applicants who do not match; **nobody is declined**, and hidden applicants come back when you loosen a filter. A "Showing X / Y" counter shows how many are visible. Dungeon and raid filters are saved separately.
+
+How groups of applicants are treated: a party that applies together is **hidden if any member matches something you exclude**, and **shown if any member matches something you include**.
+
+### Dungeon listings
+| Filter | What it does |
+| --- | --- |
+| Filter enabled | Master switch for this panel. |
+| Role | Tank / Healer / DPS buttons, with the usual include / exclude cycle. |
+| Fit my group | Only shows applicants for the roles your group is missing (1 tank, 1 healer, 3 DPS counted from your current group, you included). Updates when your group changes. |
+| Item level | Two-handle slider, 250 to 350. Bottom means no lower limit, top means no upper limit. |
+| Dungeon rating | Two-handle slider on the applicant's overall Mythic+ rating, 0 to 4200. |
+| Bloodlust class | Only bloodlust classes (green) or none of them (red). |
+| Hide bad notes | Hides applicants you have a bad note on. |
+| Only good notes | Only shows applicants you have a good note on. |
+| Class | One icon per class, four per row, with include (gold ring) / exclude (red ring and cross) / reset. **Clear** resets them. |
+
+### Raid listings
+The same panel without Fit my group and Dungeon rating, plus a **Missing buffs** button on the Class row:
+- **Missing buffs** clears the class filters, then selects every class that brings a raid buff nobody in your group (you included) brings yet.
+- The **cogwheel** next to it opens a popup where you choose which raid buffs you care about. All are selected by default; the choice is saved.
+
+| Class | Buff |
+| --- | --- |
+| Mage | Arcane Intellect |
+| Warrior | Battle Shout |
+| Priest | Power Word: Fortitude |
+| Druid | Mark of the Wild |
+| Shaman | Skyfury |
+| Evoker | Blessing of the Bronze |
+| Monk | Mystic Touch |
+| Demon Hunter | Chaos Brand |
+| Hunter | Hunter's Mark |
+| Paladin | Devotion Aura |
+| Rogue | Atrophic Poison |
+| Warlock | Curses |
+
+The list lives in `RAID_BUFFS` in `BetterFilters.lua` if the game changes it.
 
 ---
 
@@ -164,8 +232,22 @@ Because the game may stop exposing member data once you apply, the addon remembe
 | --- | --- |
 | `/bf debug` | Prints what listing data the game exposes for the first listings (useful for bug reports). |
 | `/bf spec` | Prints the raw member data and spec-icon lookup for the first listings and any applied rows. |
+| `/bf app` | Prints what the game exposes for your applicants and how the applicant filter reads them. |
 
+`/sgf` still works as an alias for the old name.
 
+---
+
+## Saved data and upgrading from Simple Group Filter
+
+Better Filters was previously called **Simple Group Filter**. Settings and notes are stored in `BetterFiltersDB`. On first load, if no `BetterFiltersDB` exists, the addon copies everything from the old `SimpleGroupFilterDB`, so your settings and notes carry over.
+
+To upgrade:
+1. Delete the old `SimpleGroupFilter` folder from `Interface/AddOns`.
+2. Install the `BetterFilters` folder.
+3. Log in once with the old saved-variables file still in place.
+
+---
 
 ## Limitations
 
@@ -173,6 +255,8 @@ These come from restrictions Blizzard places on addons, not choices in this addo
 
 - **No keyword filter.** Group titles and descriptions are protected values that addons cannot read, so filtering by text in the listing title is not possible.
 - **No group-leader item level.** The game does not expose item levels in the search results.
+- **No one-click listing.** An addon cannot type a listing title or press List Group, so the keystone button only opens the listing page.
+- **Hidden applicants are not declined.** Declining and inviting need a real click from you.
 - **The Blizzard search box cannot be filled by an addon.** Writing to it is blocked as a protected action, and so is the clipboard.
 - **Some listing data can be hidden by the game** in certain situations. Where that happens the addon leaves Blizzard's own display alone rather than guessing.
 - Positions of the timer, cancel button and role icons on applied rows depend on Blizzard's row layout and may need adjusting after a game patch.
@@ -184,6 +268,8 @@ These come from restrictions Blizzard places on addons, not choices in this addo
 - **Panel does not appear**: check the addon is enabled, then `/reload`. The panel only shows in the Dungeons and Raids categories of Premade Groups.
 - **A Lua error appears**: install a Lua error display such as BugSack/BugGrabber, or enable `/console scriptErrors 1`, and include the message in your bug report.
 - **Spec icons do not show**: run `/bf spec` and include the output in an issue.
+- **Applicant filters do nothing**: open your applicant list with a filter set, run `/bf app` and include the output in an issue.
+- **Raider.IO's panel overlaps ours**: it is moved to the right of whichever Better Filters panel is showing; reload the UI if it was loaded after us.
 - **A filter seems to have no effect**: check **Filter enabled** is on, and that the group list was refreshed after changing the setting.
 - **Notes are missing after the rename**: log in once with the old `SimpleGroupFilterDB` still present so it can be copied.
 
@@ -198,7 +284,7 @@ BetterFilters/
 └── README.md
 ```
 
-`BetterFilters.lua` is organised in sections: defaults, helpers, filtering logic (dungeons and raids), list refresh and instant sign-up hooks, the shared flat UI widgets, spec icons, notes, the dungeon and raid panels, debug commands, and startup.
+`BetterFilters.lua` is organised in sections: defaults, helpers, filtering logic (dungeons and raids), list refresh and instant sign-up hooks, the shared flat UI widgets, spec icons, raid class and tier counts, notes, the dungeon and raid panels, the keystone button, the applicant filter panels, Raider.IO support, debug commands, and startup.
 
 ---
 
@@ -212,4 +298,8 @@ Issues and pull requests are welcome. When reporting a bug, please include:
 
 The addon is written in plain Lua with no external libraries, so there is no build step: edit `BetterFilters.lua`, `/reload` in game and test.
 
+---
 
+## License
+
+Add a license of your choice here (for example MIT) before publishing.
