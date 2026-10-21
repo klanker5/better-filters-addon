@@ -10,6 +10,9 @@ local SCORE_MIN, SCORE_MAX, SCORE_STEP = 0, 4000, 50
 local KEY_MIN, KEY_MAX, KEY_STEP = 2, 25, 1
 -- raid sliders: number of tanks / healers / dps in the group (top = "or more")
 local RAID_TANK_MAX, RAID_HEALER_MAX, RAID_DPS_MAX = 4, 10, 25
+-- applicant item level slider (bottom = no lower limit, top = no upper limit)
+local ILVL_MIN, ILVL_MAX, ILVL_STEP = 250, 350, 1
+local APP_SCORE_MAX = 4200
 
 local defaults = {
     enabled    = true,
@@ -36,10 +39,31 @@ local defaults = {
     dungeons   = {},            -- [challengeMapID] = 1 (include) or 2 (exclude)
     notes      = {},            -- [leader name] = { color = "green"|"red", text = "..." }
     noteAlerts = true,          -- chat alert when a player with a note is in your group
+    -- applicant filters (when you list your own dungeon group)
+    appEnabled = true,
+    appRoles   = {},            -- ["TANK"|"HEALER"|"DAMAGER"] = 1 (include) or 2 (exclude)
+    appClasses = {},            -- [classFile] = 1 (include) or 2 (exclude)
+    appBloodlust = 0,           -- 0 any, 1 only bloodlust classes, 2 none
+    appFit = false,             -- only show applicants for the roles my group is missing
+    -- applicant filters for your own raid listing
+    appRaidEnabled = true,
+    raidBuffsIgnored = {},      -- [classFile] = true for raid buffs you don't care about
+    appRaidRoles = {},
+    appRaidClasses = {},
+    appRaidBloodlust = 0,
+    appRaidBadNote = false,
+    appRaidGoodNote = false,
+    appRaidIlvlMin = ILVL_MIN, appRaidIlvlMax = ILVL_MAX,
+    appBadNote = false,         -- hide applicants you have a bad note on
+    appGoodNote = false,        -- only show applicants you have a good note on
+    appIlvlMin = ILVL_MIN,  appIlvlMax = ILVL_MAX,
+    appScoreMin = SCORE_MIN, appScoreMax = APP_SCORE_MAX,
 }
 
 local db
 local panel                    -- our UI panel (created once the LFG UI exists)
+local appPanel                 -- the applicant filter panel (while you have a dungeon listing up)
+local appRaidPanel             -- the applicant filter panel for a raid listing
 local initialized = false
 
 -- The panel and the filters only work on the Dungeons category of Premade Groups
@@ -896,7 +920,7 @@ local function MakeToggleButton(parent, x, y, width)
 end
 
 -- On / off toggle for db[key]
-local function MakeCheck(parent, text, x, y, key, width)
+local function MakeCheck(parent, text, x, y, key, width, onChange)
     local b = MakeToggleButton(parent, x, y, width or 104)
     local function Apply()
         b:SetState(db[key] and "yes" or "off", text)
@@ -904,7 +928,7 @@ local function MakeCheck(parent, text, x, y, key, width)
     b:SetScript("OnClick", function()
         db[key] = not db[key]
         Apply()
-        RefreshList()
+        ;(onChange or RefreshList)()
     end)
     b.Refresh = Apply
     Apply()
@@ -913,7 +937,7 @@ end
 
 -- Three-state button for one playstyle value, stored in db.playstyles[value]:
 --   nil = grey (any), 1 = green (include), 2 = red (exclude)
-local function MakePlaystyleCheck(parent, text, x, y, value, store, width)
+local function MakePlaystyleCheck(parent, text, x, y, value, store, width, onChange)
     store = store or db.playstyles
     local b = MakeToggleButton(parent, x, y, width or 104)
 
@@ -932,7 +956,7 @@ local function MakePlaystyleCheck(parent, text, x, y, value, store, width)
         local state = ((store[value] or 0) + 1) % 3  -- grey -> green -> red -> grey
         store[value] = (state ~= 0) and state or nil
         Apply()
-        RefreshList()
+        ;(onChange or RefreshList)()
     end)
     b:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
@@ -949,7 +973,7 @@ end
 -- A button with three states, stored in db[key]:
 --   0 = grey (don't care), 1 = green (required), 2 = red (must not have)
 -- names = { off = "...", yes = "...", no = "..." } are the label texts.
-local function MakeTriCheck(parent, x, y, key, names)
+local function MakeTriCheck(parent, x, y, key, names, onChange)
     local b = MakeToggleButton(parent, x, y, 212)
 
     local function Apply()
@@ -966,7 +990,7 @@ local function MakeTriCheck(parent, x, y, key, names)
     b:SetScript("OnClick", function()
         db[key] = (db[key] + 1) % 3   -- grey -> green -> red -> grey
         Apply()
-        RefreshList()
+        ;(onChange or RefreshList)()
     end)
     b:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
@@ -1079,7 +1103,7 @@ local function CreateRangeSlider(parent, x, y, width, cfg)
     local changed = false
 
     local function Changed()
-        if not cfg.noRefresh then RefreshList() end
+        if cfg.onChange then cfg.onChange() elseif not cfg.noRefresh then RefreshList() end
     end
 
     local function StopDrag()
@@ -2895,6 +2919,629 @@ local function BuildRaidPanel()
 end
 
 ---------------------------------------------------------------------------
+-- Applicants: filter the people who apply to your own dungeon listing
+---------------------------------------------------------------------------
+-- The game fills the applicant list itself; after it does, we rebuild it without
+-- the applicants who don't match the filters. Nobody is declined: hidden
+-- applicants come back as soon as you loosen a filter.
+
+local APP_ROLES = {
+    { value = "TANK", label = "Tank" },
+    { value = "HEALER", label = "Healer" },
+    { value = "DAMAGER", label = "DPS" },
+}
+local APP_CLASS_FILES = { "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST", "DEATHKNIGHT",
+    "SHAMAN", "MAGE", "WARLOCK", "MONK", "DRUID", "DEMONHUNTER", "EVOKER" }
+
+local appSummaries = {}       -- ["dungeon"|"raid"] = "Showing 5 / 8" text
+local applyingAppFilter = false
+
+-- "dungeon" or "raid" while the listing you have up is one of those, else nil
+local function ListingKind()
+    if not (C_LFGList and C_LFGList.GetActiveEntryInfo) then return nil end
+    local info = C_LFGList.GetActiveEntryInfo()
+    if type(info) ~= "table" or not info.activityIDs then return nil end
+    local id = info.activityIDs[1]
+    if not usable(id) or not id then return nil end
+    local a = C_LFGList.GetActivityInfoTable(id)
+    if not (a and usable(a.categoryID)) then return nil end
+    if a.categoryID == DUNGEON_CATEGORY_ID then return "dungeon" end
+    if a.categoryID == RAID_CATEGORY_ID then return "raid" end
+    return nil
+end
+
+-- the saved settings of each panel start with this
+local function Prefix(kind) return kind == "raid" and "appRaid" or "app" end
+
+-- { name, class, itemLevel, score, role } for one member of an applicant
+local function ApplicantMember(appID, idx)
+    local name, class, _, _, itemLevel, _, tank, healer, damage, assignedRole, _, score =
+        C_LFGList.GetApplicantMemberInfo(appID, idx)
+    if type(name) == "table" then
+        local t = name
+        name, class, itemLevel, score = t.name, t.classFilename or t.class, t.itemLevel, t.dungeonScore
+        tank, healer, damage, assignedRole = t.tank, t.healer, t.damage, t.assignedRole
+    end
+    local role = assignedRole
+    if not usable(role) or not role or role == "NONE" then
+        role = (usable(tank) and tank and "TANK") or (usable(healer) and healer and "HEALER")
+            or (usable(damage) and damage and "DAMAGER") or nil
+    end
+    return {
+        name = usable(name) and name or nil,
+        class = usable(class) and class or nil,
+        itemLevel = usable(itemLevel) and itemLevel or nil,
+        score = usable(score) and score or nil,
+        role = role,
+    }
+end
+
+-- Filters for a group of applicants (one person or a party). A group is hidden if
+-- ANY member matches something you exclude, and shown if ANY member matches
+-- something you include.
+
+-- store[value] = 1 (include) / 2 (exclude); getValue(m) gives a member's value
+local function GroupTriPass(store, members, field)
+    local anyInclude, included = false, false
+    for _, v in pairs(store) do
+        if v == 1 then anyInclude = true break end
+    end
+    for _, m in ipairs(members) do
+        local state = m[field] and store[m[field]]
+        if state == 2 then return false end
+        if state == 1 then included = true end
+    end
+    return (not anyInclude) or included
+end
+
+-- roles my group still needs (a dungeon group is 1 tank, 1 healer, 3 dps)
+local function MissingRoles()
+    local r = GetPartyRoles()
+    return { TANK = r.TANK < 1, HEALER = r.HEALER < 1, DAMAGER = r.DAMAGER < 3 }
+end
+
+-- roles my group still needs (a dungeon group is 1 tank, 1 healer, 3 dps)
+local function MissingRoles()
+    local r = GetPartyRoles()
+    return { TANK = r.TANK < 1, HEALER = r.HEALER < 1, DAMAGER = r.DAMAGER < 3 }
+end
+
+local function GroupPasses(members, kind)
+    local P = Prefix(kind)
+    local function get(name) return db[P .. name] end
+
+    if kind == "dungeon" and db.appFit then
+        local missing = MissingRoles()
+        if missing.TANK or missing.HEALER or missing.DAMAGER then
+            local fits = false
+            for _, m in ipairs(members) do
+                if m.role and missing[m.role] then fits = true break end
+            end
+            if not fits then return false end
+        end
+    end
+    if not GroupTriPass(get("Roles"), members, "role") then return false end
+    if not GroupTriPass(get("Classes"), members, "class") then return false end
+
+    local bl = get("Bloodlust")
+    if bl ~= 0 then
+        local any = false
+        for _, m in ipairs(members) do
+            if m.class and BLOODLUST_CLASSES[m.class] then any = true break end
+        end
+        if bl == 1 and not any then return false end
+        if bl == 2 and any then return false end
+    end
+
+    -- ranges: at least one member inside (members the game gives no number for count as inside)
+    local lo, hi = get("IlvlMin"), get("IlvlMax")
+    if lo > ILVL_MIN or hi < ILVL_MAX then
+        local ok = false
+        for _, m in ipairs(members) do
+            local v = m.itemLevel
+            if not v or ((lo <= ILVL_MIN or v >= lo) and (hi >= ILVL_MAX or v <= hi)) then
+                ok = true break
+            end
+        end
+        if not ok then return false end
+    end
+    if kind == "dungeon" and (db.appScoreMin > SCORE_MIN or db.appScoreMax < APP_SCORE_MAX) then
+        local ok = false
+        for _, m in ipairs(members) do
+            local v = m.score
+            if not v or ((db.appScoreMin <= SCORE_MIN or v >= db.appScoreMin)
+                and (db.appScoreMax >= APP_SCORE_MAX or v <= db.appScoreMax)) then
+                ok = true break
+            end
+        end
+        if not ok then return false end
+    end
+
+    if get("BadNote") or get("GoodNote") then
+        local good, bad = false, false
+        for _, m in ipairs(members) do
+            local note = m.name and db.notes[NormalizeName(m.name) or ""]
+            if note and note.color == "red" then bad = true end
+            if note and note.color == "green" then good = true end
+        end
+        if get("BadNote") and bad then return false end
+        if get("GoodNote") and not good then return false end
+    end
+    return true
+end
+
+local function ApplicantPasses(appID, kind)
+    kind = kind or ListingKind() or "dungeon"
+    local a, _, _, d = C_LFGList.GetApplicantInfo(appID)
+    local numMembers = (type(a) == "table") and a.numMembers or d
+    if not usable(numMembers) or not numMembers then return true end
+    local members = {}
+    for idx = 1, numMembers do
+        local ok, m = pcall(ApplicantMember, appID, idx)
+        if ok and m then members[#members + 1] = m end
+    end
+    if #members == 0 then return true end
+    return GroupPasses(members, kind)
+end
+
+local function ApplyApplicantFilter(viewer)
+    if applyingAppFilter then return end
+    viewer = viewer or (LFGListFrame and LFGListFrame.ApplicationViewer)
+    local box = viewer and viewer.ScrollBox
+    if not (box and box.GetDataProvider and box.SetDataProvider and CreateDataProvider) then return end
+    local dp = box:GetDataProvider()
+    if not (dp and dp.Enumerate) then return end
+
+    local kind = ListingKind()
+    local filtering = kind and db[Prefix(kind) .. "Enabled"]
+    local filtered, total, shown = CreateDataProvider(), 0, 0
+    for _, elem in dp:Enumerate() do
+        total = total + 1
+        local id
+        if type(elem) == "number" then
+            id = elem
+        elseif type(elem) == "table" then
+            id = elem.applicantID or elem.id or elem.applicantId
+            if not id then
+                for _, v in pairs(elem) do
+                    if type(v) == "number" then id = v break end
+                end
+            end
+        end
+        if not filtering or not id or ApplicantPasses(id, kind) then
+            filtered:Insert(elem)
+            shown = shown + 1
+        end
+    end
+    local text = appSummaries[kind or ""]
+    if text then
+        text:SetText(total > 0 and ("Showing %d / %d"):format(shown, total) or "No applicants")
+    end
+    if shown ~= total then
+        applyingAppFilter = true
+        box:SetDataProvider(filtered, ScrollBoxConstants and ScrollBoxConstants.RetainScrollPosition)
+        applyingAppFilter = false
+    end
+end
+
+-- re-run the game's own list update, which runs our filter straight after it
+local function RefreshApplicants()
+    local viewer = LFGListFrame and LFGListFrame.ApplicationViewer
+    if viewer and LFGListApplicationViewer_UpdateResults then
+        local ok, err = pcall(LFGListApplicationViewer_UpdateResults, viewer)
+        if not ok then print("|cff33ff99BF:|r couldn't refresh applicants:", err) end
+    end
+end
+
+local function UpdateApplicantPanels()
+    local viewer = LFGListFrame and LFGListFrame.ApplicationViewer
+    local kind = viewer and viewer:IsShown() and ListingKind() or nil
+    if appPanel then appPanel:SetShown(kind == "dungeon") end
+    if appRaidPanel then appRaidPanel:SetShown(kind == "raid") end
+end
+
+local MissingBuffClasses
+-- Each raid buff and the class that brings it (edit here if the game changes them)
+local RAID_BUFFS = {
+    { class = "MAGE",        buff = "Arcane Intellect" },
+    { class = "WARRIOR",     buff = "Battle Shout" },
+    { class = "PRIEST",      buff = "Power Word: Fortitude" },
+    { class = "DRUID",       buff = "Mark of the Wild" },
+    { class = "SHAMAN",      buff = "Skyfury" },
+    { class = "EVOKER",      buff = "Blessing of the Bronze" },
+    { class = "MONK",        buff = "Mystic Touch" },
+    { class = "DEMONHUNTER", buff = "Chaos Brand" },
+    { class = "HUNTER",      buff = "Hunter's Mark" },
+    { class = "PALADIN",     buff = "Devotion Aura" },
+    { class = "ROGUE",       buff = "Atrophic Poison" },
+    { class = "WARLOCK",     buff = "Curses" },
+}
+
+-- classes with a raid buff you care about that nobody in my group (me included) can provide
+function MissingBuffClasses()
+    local have = {}
+    local function Add(unit)
+        if not UnitExists(unit) then return end
+        local _, file = UnitClass(unit)
+        if usable(file) and file then have[file] = true end
+    end
+    Add("player")
+    if IsInRaid() then
+        for i = 1, GetNumGroupMembers() do Add("raid" .. i) end
+    elseif IsInGroup() then
+        for i = 1, GetNumGroupMembers() - 1 do Add("party" .. i) end
+    end
+    local missing = {}
+    for _, b in ipairs(RAID_BUFFS) do
+        if not have[b.class] and not db.raidBuffsIgnored[b.class] then
+            missing[#missing + 1] = b.class
+        end
+    end
+    return missing
+end
+
+-- kind = "dungeon" or "raid"; the raid panel has no Fit my group and no rating
+local function BuildApplicantPanel(kind)
+    local viewer = LFGListFrame.ApplicationViewer
+    if not viewer then return end
+    local isRaid = kind == "raid"
+    local P = Prefix(kind)
+    local anchor = PVEFrame or LFGListFrame
+
+    local panelF = CreateFrame("Frame", isRaid and "BetterFiltersRaidApplicantPanel" or "BetterFiltersApplicantPanel", LFGListFrame)
+    panelF:SetWidth(240)
+    panelF:SetPoint("TOPLEFT", anchor, "TOPRIGHT", 4, 0)
+    if isRaid then appRaidPanel = panelF else appPanel = panelF end
+
+    local edge = panelF:CreateTexture(nil, "BACKGROUND", nil, -2)
+    edge:SetPoint("TOPLEFT", -1, 1)
+    edge:SetPoint("BOTTOMRIGHT", 1, -1)
+    edge:SetColorTexture(unpack(THEME.border))
+    local bg = panelF:CreateTexture(nil, "BACKGROUND", nil, -1)
+    bg:SetAllPoints()
+    bg:SetColorTexture(unpack(THEME.bg))
+
+    local title = panelF:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    title:SetPoint("TOP", panelF, "TOP", 0, -9)
+    title:SetText("Better Filters")
+    local divider = panelF:CreateTexture(nil, "ARTWORK")
+    divider:SetColorTexture(unpack(THEME.border))
+    divider:SetHeight(1)
+    divider:SetPoint("TOPLEFT", panelF, "TOPLEFT", 0, -32)
+    divider:SetPoint("TOPRIGHT", panelF, "TOPRIGHT", 0, -32)
+
+    local LEFT, WIDTH = 14, 212
+    local COL2 = LEFT + 108
+    local ROW_H, ROW_STEP, LABEL_H, SECTION = 22, 26, 20, 14
+    local y = -44
+
+    MakeCheck(panelF, "Filter enabled", LEFT, y, P .. "Enabled", nil, RefreshApplicants)
+    local summary = panelF:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    summary:SetPoint("CENTER", panelF, "TOPLEFT", COL2 + 52, y - 11)
+    summary:SetText("")
+    appSummaries[kind] = summary
+    y = y - ROW_H - SECTION
+
+    -- Role
+    MakeLabel(panelF, "Role", LEFT, y)
+    y = y - LABEL_H
+    for i, r in ipairs(APP_ROLES) do
+        MakePlaystyleCheck(panelF, r.label, LEFT + (i - 1) * 72, y, r.value, db[P .. "Roles"], 68, RefreshApplicants)
+    end
+    y = y - ROW_STEP
+    if not isRaid then
+        local fitCheck = MakeCheck(panelF, "Fit my group", LEFT, y, "appFit", WIDTH, RefreshApplicants)
+        fitCheck:SetScript("OnEnter", function(self)
+            local m = MissingRoles()
+            local need = {}
+            if m.TANK then need[#need + 1] = "tank" end
+            if m.HEALER then need[#need + 1] = "healer" end
+            if m.DAMAGER then need[#need + 1] = "dps" end
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText("Fit my group")
+            GameTooltip:AddLine("Only shows applicants for the roles your group is missing.", 1, 1, 1, true)
+            GameTooltip:AddLine(#need > 0 and ("Missing now: " .. table.concat(need, ", ")) or "Your group has every role.", 0.7, 0.7, 0.7, true)
+            GameTooltip:Show()
+        end)
+        fitCheck:SetScript("OnLeave", GameTooltip_Hide)
+        y = y - ROW_STEP
+    end
+    y = y - (ROW_H - ROW_STEP) - SECTION     -- the last row of the section is ROW_H tall
+
+    -- Sliders
+    CreateRangeSlider(panelF, LEFT, y, WIDTH, {
+        title = "Item level",
+        minValue = ILVL_MIN, maxValue = ILVL_MAX, step = ILVL_STEP,
+        loKey = P .. "IlvlMin", hiKey = P .. "IlvlMax",
+        onChange = RefreshApplicants,
+    })
+    y = y - 46 - (isRaid and SECTION or 8)
+    if not isRaid then
+        CreateRangeSlider(panelF, LEFT, y, WIDTH, {
+            title = "Dungeon rating",
+            minValue = SCORE_MIN, maxValue = APP_SCORE_MAX, step = SCORE_STEP,
+            loKey = "appScoreMin", hiKey = "appScoreMax",
+            onChange = RefreshApplicants,
+        })
+        y = y - 46 - SECTION
+    end
+
+    -- Bloodlust and notes
+    MakeLabel(panelF, "Applicant", LEFT, y)
+    y = y - LABEL_H
+    MakeTriCheck(panelF, LEFT, y, P .. "Bloodlust",
+        { off = "Bloodlust class", yes = "Bloodlust class only", no = "No bloodlust class" }, RefreshApplicants)
+    y = y - ROW_STEP
+    local function NoteToggle(key, label, state, tip)
+        local b = MakeToggleButton(panelF, LEFT, y, WIDTH)
+        local function Apply() b:SetState(db[key] and state or "off", label) end
+        b:SetScript("OnClick", function()
+            db[key] = not db[key]
+            Apply()
+            RefreshApplicants()
+        end)
+        b:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText(label)
+            GameTooltip:AddLine(tip, 1, 1, 1, true)
+            GameTooltip:Show()
+        end)
+        b:SetScript("OnLeave", GameTooltip_Hide)
+        Apply()
+        y = y - ROW_STEP
+    end
+    NoteToggle(P .. "BadNote", "Hide bad notes", "no", "Hides applicants (or parties) with someone you have a bad note on.")
+    NoteToggle(P .. "GoodNote", "Only good notes", "yes", "Only shows applicants (or parties) with someone you have a good note on.")
+    y = y + ROW_STEP
+    y = y - ROW_H - SECTION
+
+    -- Class
+    MakeLabel(panelF, "Class", LEFT, y)
+    local classHeaderY = y
+    local clear = MakeToggleButton(panelF, 0, 0, 54)
+    clear:SetHeight(18)
+    clear:ClearAllPoints()
+    clear:SetPoint("TOPRIGHT", panelF, "TOPRIGHT", -LEFT, y + 3)
+    clear:SetState("off", "Clear")
+    local classButtons = {}
+    y = y - LABEL_H
+
+    -- class icons, 4 per row; click cycles include (gold ring) / exclude (red ring + cross) / reset
+    local classes = {}
+    for _, file in ipairs(APP_CLASS_FILES) do
+        classes[#classes + 1] = { file = file, name = (LOCALIZED_CLASS_NAMES_MALE and LOCALIZED_CLASS_NAMES_MALE[file]) or file }
+    end
+    table.sort(classes, function(a, b) return a.name < b.name end)
+    local SIZE, GAP = 44, 12
+
+    local function ClassVisuals()
+        local anyIncluded = false
+        for _, v in pairs(db[P .. "Classes"]) do
+            if v == 1 then anyIncluded = true break end
+        end
+        for _, b in ipairs(classButtons) do
+            local state = db[P .. "Classes"][b.classFile]
+            if state == 1 then
+                b.border:SetColorTexture(1, 0.82, 0, 1)
+                b.border:Show(); b.cross:Hide(); b.icon:SetAlpha(1)
+            elseif state == 2 then
+                b.border:SetColorTexture(0.9, 0.15, 0.15, 1)
+                b.border:Show(); b.cross:Show(); b.icon:SetAlpha(0.35)
+            else
+                b.border:Hide(); b.cross:Hide()
+                b.icon:SetAlpha(anyIncluded and 0.45 or 1)
+            end
+        end
+    end
+    clear:SetScript("OnClick", function()
+        wipe(db[P .. "Classes"])
+        ClassVisuals()
+        RefreshApplicants()
+    end)
+
+    for i, c in ipairs(classes) do
+        local col = (i - 1) % 4
+        local row = math.floor((i - 1) / 4)
+        local b = CreateFrame("Button", nil, panelF)
+        b:SetSize(SIZE, SIZE)
+        b:SetPoint("TOPLEFT", panelF, "TOPLEFT", LEFT + col * (SIZE + GAP), y - row * (SIZE + GAP))
+        b.classFile = c.file
+
+        b.border = b:CreateTexture(nil, "BACKGROUND")
+        b.border:SetPoint("TOPLEFT", -3, 3)
+        b.border:SetPoint("BOTTOMRIGHT", 3, -3)
+        b.border:Hide()
+        b.edge = b:CreateTexture(nil, "BACKGROUND", nil, 1)
+        b.edge:SetPoint("TOPLEFT", -1, 1)
+        b.edge:SetPoint("BOTTOMRIGHT", 1, -1)
+        b.edge:SetColorTexture(unpack(THEME.border))
+
+        b.icon = b:CreateTexture(nil, "ARTWORK")
+        b.icon:SetAllPoints()
+        local atlas = "classicon-" .. c.file:lower()
+        if C_Texture and C_Texture.GetAtlasInfo and C_Texture.GetAtlasInfo(atlas) then
+            b.icon:SetAtlas(atlas)
+        else
+            b.icon:SetTexture("Interface\\GLUES\\CHARACTERCREATE\\UI-CHARACTERCREATE-CLASSES")
+            local tc = CLASS_ICON_TCOORDS and CLASS_ICON_TCOORDS[c.file]
+            if tc then b.icon:SetTexCoord(unpack(tc)) end
+        end
+
+        b.cross = b:CreateTexture(nil, "OVERLAY", nil, 2)
+        b.cross:SetTexture("Interface\\RaidFrame\\ReadyCheck-NotReady")
+        b.cross:SetSize(30, 30)
+        b.cross:SetPoint("CENTER", b, "CENTER", 0, 0)
+        b.cross:Hide()
+
+        b:SetScript("OnClick", function(self)
+            local state = ((db[P .. "Classes"][self.classFile] or 0) + 1) % 3
+            db[P .. "Classes"][self.classFile] = (state ~= 0) and state or nil
+            ClassVisuals()
+            RefreshApplicants()
+        end)
+        b:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            local color = RAID_CLASS_COLORS and RAID_CLASS_COLORS[c.file]
+            if color then
+                GameTooltip:SetText(c.name, color.r, color.g, color.b)
+            else
+                GameTooltip:SetText(c.name)
+            end
+            GameTooltip:AddLine("Click to cycle: include / exclude / reset", 1, 1, 1)
+            GameTooltip:Show()
+        end)
+        b:SetScript("OnLeave", GameTooltip_Hide)
+        classButtons[#classButtons + 1] = b
+    end
+    ClassVisuals()
+
+    -- Missing buffs (raid only): select the classes that bring a raid buff nobody in
+    -- your group brings yet
+    if isRaid then
+        local mb = MakeToggleButton(panelF, 0, 0, 80)
+        mb:SetHeight(18)
+        mb:ClearAllPoints()
+        mb:SetPoint("TOPRIGHT", panelF, "TOPRIGHT", -(LEFT + 80), classHeaderY + 3)
+        mb:SetState("off", "Missing buffs")
+        mb:SetScript("OnClick", function()
+            local missing = MissingBuffClasses()
+            wipe(db[P .. "Classes"])
+            for _, file in ipairs(missing) do db[P .. "Classes"][file] = 1 end
+            ClassVisuals()
+            RefreshApplicants()
+            if #missing == 0 then print("|cff33ff99BF:|r your group already has every raid buff.") end
+        end)
+        mb:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText("Missing buffs")
+            GameTooltip:AddLine("Clears the class filters and selects the classes that bring a raid buff your group doesn't have yet.", 1, 1, 1, true)
+            local missing = MissingBuffClasses()
+            local names = {}
+            for _, file in ipairs(missing) do
+                names[#names + 1] = (LOCALIZED_CLASS_NAMES_MALE and LOCALIZED_CLASS_NAMES_MALE[file]) or file
+            end
+            GameTooltip:AddLine(#names > 0 and ("Missing now: " .. table.concat(names, ", ")) or "Your group has every raid buff.", 0.7, 0.7, 0.7, true)
+            GameTooltip:Show()
+        end)
+        mb:SetScript("OnLeave", GameTooltip_Hide)
+
+        -- cogwheel: pick the raid buffs you care about
+        local cog = CreateFrame("Button", nil, panelF)
+        cog:SetSize(18, 18)
+        cog:SetPoint("TOPRIGHT", panelF, "TOPRIGHT", -(LEFT + 58), classHeaderY + 3)
+        local cogEdge = cog:CreateTexture(nil, "BACKGROUND", nil, -1)
+        cogEdge:SetPoint("TOPLEFT", -1, 1)
+        cogEdge:SetPoint("BOTTOMRIGHT", 1, -1)
+        cogEdge:SetColorTexture(unpack(TOGGLE_COLORS.off.border))
+        local cogBg = cog:CreateTexture(nil, "BACKGROUND", nil, 0)
+        cogBg:SetAllPoints()
+        cogBg:SetColorTexture(unpack(TOGGLE_COLORS.off.bg))
+        local cogIcon = cog:CreateTexture(nil, "ARTWORK")
+        cogIcon:SetPoint("TOPLEFT", 2, -2)
+        cogIcon:SetPoint("BOTTOMRIGHT", -2, 2)
+        cogIcon:SetTexture("Interface\\Buttons\\UI-OptionsButton")
+        local cogHover = cog:CreateTexture(nil, "HIGHLIGHT")
+        cogHover:SetAllPoints()
+        cogHover:SetColorTexture(1, 0.82, 0, 0.10)
+
+        local pop = CreateFrame("Frame", nil, panelF)
+        pop:SetSize(220, 34 + #RAID_BUFFS * 24 + 4)
+        pop:SetPoint("TOPRIGHT", cog, "BOTTOMRIGHT", 0, -4)
+        pop:SetFrameStrata("DIALOG")
+        pop:EnableMouse(true)
+        pop:Hide()
+        local pEdge = pop:CreateTexture(nil, "BACKGROUND", nil, -2)
+        pEdge:SetPoint("TOPLEFT", -1, 1)
+        pEdge:SetPoint("BOTTOMRIGHT", 1, -1)
+        pEdge:SetColorTexture(unpack(THEME.border))
+        local pBg = pop:CreateTexture(nil, "BACKGROUND", nil, -1)
+        pBg:SetAllPoints()
+        pBg:SetColorTexture(unpack(THEME.bg))
+        local pTitle = pop:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        pTitle:SetPoint("TOP", pop, "TOP", 0, -9)
+        pTitle:SetText("Raid buffs I care about")
+        for i, rb in ipairs(RAID_BUFFS) do
+            local cname = (LOCALIZED_CLASS_NAMES_MALE and LOCALIZED_CLASS_NAMES_MALE[rb.class]) or rb.class
+            local label = cname .. ": " .. rb.buff
+            local row = MakeToggleButton(pop, 10, -(30 + (i - 1) * 24), 200)
+            local function Apply()
+                row:SetState(db.raidBuffsIgnored[rb.class] and "off" or "yes", label)
+            end
+            row:SetScript("OnClick", function()
+                db.raidBuffsIgnored[rb.class] = (not db.raidBuffsIgnored[rb.class]) or nil
+                Apply()
+            end)
+            Apply()
+        end
+        cog:SetScript("OnClick", function() pop:SetShown(not pop:IsShown()) end)
+        cog:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText("Raid buffs I care about")
+            GameTooltip:AddLine("Choose which buffs the Missing buffs button looks for.", 1, 1, 1, true)
+            GameTooltip:Show()
+        end)
+        cog:SetScript("OnLeave", GameTooltip_Hide)
+        panelF:HookScript("OnHide", function() pop:Hide() end)
+    end
+    local classRows = math.ceil(#classes / 4)
+    y = y - classRows * SIZE - (classRows - 1) * GAP
+
+    panelF:SetHeight(-y + 14)
+    panelF:Hide()
+end
+
+local appHooksInstalled = false
+
+local function InstallApplicantHooks()
+    if appHooksInstalled then return end
+    appHooksInstalled = true
+    local viewer = LFGListFrame.ApplicationViewer
+    if not viewer then return end
+
+    viewer:HookScript("OnShow", function()
+        UpdateApplicantPanels()
+        C_Timer.After(0, UpdateApplicantPanels)
+    end)
+    viewer:HookScript("OnHide", function()
+        if appPanel then appPanel:Hide() end
+        if appRaidPanel then appRaidPanel:Hide() end
+    end)
+    local ev = CreateFrame("Frame")
+    ev:RegisterEvent("LFG_LIST_ACTIVE_ENTRY_UPDATE")
+    ev:SetScript("OnEvent", UpdateApplicantPanels)
+
+    -- Also hide the rows themselves as the game draws them (works even where the
+    -- list can't be rebuilt)
+    if LFGListApplicationViewer_UpdateApplicantMember then
+        hooksecurefunc("LFGListApplicationViewer_UpdateApplicantMember", function(member, appID)
+            pcall(function()
+                local row = member and member:GetParent()
+                if not (row and appID and usable(appID)) then return end
+                local kind = ListingKind()
+                local filtering = kind and db[Prefix(kind) .. "Enabled"]
+                row:SetShown(not filtering or ApplicantPasses(appID, kind))
+            end)
+        end)
+    end
+    if LFGListApplicationViewer_UpdateResults then
+        hooksecurefunc("LFGListApplicationViewer_UpdateResults", function(self)
+            pcall(ApplyApplicantFilter, self)
+        end)
+    else
+        print("|cff33ff99BF:|r the applicant list wasn't found, applicant filters are off.")
+    end
+end
+
+local function BuildApplicantPanels()
+    for _, kind in ipairs({ "dungeon", "raid" }) do
+        local ok, err = pcall(BuildApplicantPanel, kind)
+        if not ok then print("|cff33ff99BF:|r couldn't build the " .. kind .. " applicant panel:", err) end
+    end
+    InstallApplicantHooks()
+    UpdateApplicantPanels()
+end
+
+---------------------------------------------------------------------------
 -- Debugging: /sgf debug
 ---------------------------------------------------------------------------
 
@@ -2975,6 +3622,44 @@ local function DebugSpec()
     end
 end
 
+
+local function DebugApp()
+    local v = LFGListFrame and LFGListFrame.ApplicationViewer
+    local function p(...) print("|cff33ff99BF app:|r", ...) end
+    p("viewer", v ~= nil, "ScrollBox", v and v.ScrollBox ~= nil,
+      "UpdateResults", LFGListApplicationViewer_UpdateResults ~= nil,
+      "UpdateApplicantMember", LFGListApplicationViewer_UpdateApplicantMember ~= nil)
+    p("listing kind", tostring(ListingKind()), "filter on", tostring(db.appEnabled), tostring(db.appRaidEnabled))
+    local dp = v and v.ScrollBox and v.ScrollBox.GetDataProvider and v.ScrollBox:GetDataProvider()
+    p("dataProvider", dp ~= nil, "Enumerate", dp and dp.Enumerate ~= nil)
+    local apps = C_LFGList.GetApplicants() or {}
+    p("applicants", #apps)
+    for i = 1, math.min(#apps, 3) do
+        local id = apps[i]
+        local a, b, c, d = C_LFGList.GetApplicantInfo(id)
+        p(i, "id", Describe(id), "info", type(a), Describe(d), "passes", tostring(ApplicantPasses(id)))
+        local ok, m = pcall(ApplicantMember, id, 1)
+        if ok then
+            p("  member", Describe(m.name), "class", Describe(m.class), "role", Describe(m.role),
+              "ilvl", Describe(m.itemLevel), "score", Describe(m.score))
+        else
+            p("  member error", m)
+        end
+    end
+    if dp and dp.Enumerate then
+        local n = 0
+        for _, e in dp:Enumerate() do
+            n = n + 1
+            if n <= 2 then
+                local keys = {}
+                if type(e) == "table" then for k in pairs(e) do keys[#keys + 1] = tostring(k) end end
+                p("element", type(e), table.concat(keys, ","))
+            end
+        end
+        p("elements", n)
+    end
+end
+
 SLASH_BETTERFILTERS1 = "/bf"
 SLASH_BETTERFILTERS2 = "/sgf"
 SlashCmdList["BETTERFILTERS"] = function(msg)
@@ -2982,6 +3667,9 @@ SlashCmdList["BETTERFILTERS"] = function(msg)
     if (msg or ""):lower():match("^debug") then
         local ok, err = pcall(DebugDump)
         if not ok then print("|cff33ff99BF:|r debug error:", err) end
+    elseif (msg or ""):lower():match("^app") then
+        local ok, err = pcall(DebugApp)
+        if not ok then print("|cff33ff99BF:|r app error:", err) end
     elseif (msg or ""):lower():match("^spec") then
         local ok, err = pcall(DebugSpec)
         if not ok then print("|cff33ff99BF:|r spec error:", err) end
@@ -3024,6 +3712,13 @@ local function InitDB()
         end
     end
 
+    -- applicant filter changes: note filters are plain on/off, ranges were widened
+    if type(db.appBadNote) ~= "boolean" then db.appBadNote = db.appBadNote == 2 end
+    if type(db.appGoodNote) ~= "boolean" then db.appGoodNote = db.appGoodNote == 1 end
+    if db.appIlvlMax == 300 then db.appIlvlMax = ILVL_MAX end
+    if db.appIlvlMin < ILVL_MIN then db.appIlvlMin = ILVL_MIN end
+    if db.appScoreMax == SCORE_MAX then db.appScoreMax = APP_SCORE_MAX end
+
     -- older versions stored these as true/false; now 0 / 1 / 2
     for _, key in ipairs({ "hasTank", "hasHealer", "bloodlust" }) do
         local v = db[key]
@@ -3050,6 +3745,8 @@ local placingRaiderIO = false
 local function ShownPanel()
     if panel and panel:IsShown() then return panel end
     if raidPanel and raidPanel:IsShown() then return raidPanel end
+    if appPanel and appPanel:IsShown() then return appPanel end
+    if appRaidPanel and appRaidPanel:IsShown() then return appRaidPanel end
 end
 
 local function PlaceRaiderIO()
@@ -3057,12 +3754,7 @@ local function PlaceRaiderIO()
     local window = PVEFrame or LFGListFrame
     if not (anchor and anchor.SetPoint and window) then return end
 
-    local target
-    if panel and panel:IsShown() then
-        target = panel
-    elseif raidPanel and raidPanel:IsShown() then
-        target = raidPanel
-    end
+    local target = ShownPanel()
 
     placingRaiderIO = true
     anchor:ClearAllPoints()
@@ -3078,7 +3770,7 @@ end
 local function InstallRaiderIOSupport()
     local function Update() pcall(PlaceRaiderIO) end
 
-    for _, f in ipairs({ panel, raidPanel }) do
+    for _, f in ipairs({ panel, raidPanel, appPanel, appRaidPanel }) do
         if f then
             f:HookScript("OnShow", Update)
             f:HookScript("OnHide", Update)
@@ -3142,6 +3834,10 @@ local function RaiseListingTooltip()
         after = panel
     elseif raidPanel and raidPanel:IsShown() then
         after = raidPanel
+    elseif appPanel and appPanel:IsShown() then
+        after = appPanel
+    elseif appRaidPanel and appRaidPanel:IsShown() then
+        after = appRaidPanel
     end
     if after and GameTooltip:IsShown() then
         GameTooltip:ClearAllPoints()
@@ -3180,6 +3876,7 @@ local function TryInit()
         { "spec icons", InstallSpecHooks },
         { "dungeon panel", BuildPanel },
         { "raid panel", BuildRaidPanel },
+        { "applicant panels", BuildApplicantPanels },
         { "Raider.IO support", InstallRaiderIOSupport },
         { "tooltip fix", InstallTooltipFix },
     }
@@ -3220,6 +3917,9 @@ frame:SetScript("OnEvent", function(self, event, arg1)
     else
         if event == "GROUP_ROSTER_UPDATE" then
             pcall(CheckGroupNotes, false)
+        end
+        if db and db.appFit and appPanel and appPanel:IsShown() then
+            pcall(RefreshApplicants)
         end
         -- party or spec changed: re-check "Fit my party"
         if db and db.partyFit then RefreshList() end
