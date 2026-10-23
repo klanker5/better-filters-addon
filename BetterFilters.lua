@@ -35,6 +35,7 @@ local defaults = {
     raidDpsMin = 0,    raidDpsMax = RAID_DPS_MAX,
     partyFit   = false,         -- only show groups with room for my party's roles
     instantSignUp = true,       -- clicking a listing signs up straight away
+    overviewMode = "ilvl",     -- Group Overview: "ilvl" | "class" | "tier" | "buff"
     signUpRoles = {},           -- [classFile] = "TANK"|"HEALER"|"DAMAGER": role you sign up as
     signUpNote = "",            -- text put in the note box when you sign up to a group
     dungeons   = {},            -- [challengeMapID] = 1 (include) or 2 (exclude)
@@ -3103,12 +3104,13 @@ local function Prefix(kind) return kind == "raid" and "appRaid" or "app" end
 
 -- { name, class, itemLevel, score, role } for one member of an applicant
 local function ApplicantMember(appID, idx)
-    local name, class, _, _, itemLevel, _, tank, healer, damage, assignedRole, _, score =
+    local name, class, _, _, itemLevel, _, tank, healer, damage, assignedRole, _, score, _, _, _, specID =
         C_LFGList.GetApplicantMemberInfo(appID, idx)
     if type(name) == "table" then
         local t = name
         name, class, itemLevel, score = t.name, t.classFilename or t.class, t.itemLevel, t.dungeonScore
         tank, healer, damage, assignedRole = t.tank, t.healer, t.damage, t.assignedRole
+        specID = t.specID
     end
     local role = assignedRole
     if not usable(role) or not role or role == "NONE" then
@@ -3120,6 +3122,7 @@ local function ApplicantMember(appID, idx)
         class = usable(class) and class or nil,
         itemLevel = usable(itemLevel) and itemLevel or nil,
         score = usable(score) and score or nil,
+        specID = usable(specID) and specID or nil,
         role = role,
     }
 end
@@ -3302,7 +3305,7 @@ local RAID_BUFFS = {
     { class = "HUNTER",      buff = "Hunter's Mark" },
     { class = "PALADIN",     buff = "Devotion Aura" },
     { class = "ROGUE",       buff = "Atrophic Poison" },
-    { class = "WARLOCK",     buff = "Curses" },
+    { class = "WARLOCK",     buff = "Curses/Gates" },
 }
 
 -- classes with a raid buff you care about that nobody in my group (me included) can provide
@@ -3327,6 +3330,528 @@ function MissingBuffClasses()
     end
     return missing
 end
+
+---------------------------------------------------------------------------
+-- Group Overview: your group or raid, regrouped by item level / class / tier / raid buff
+---------------------------------------------------------------------------
+
+-- (kept inside a do-block: the game allows at most 200 top-level locals per file)
+local ToggleOverview, CacheApplicantLevels
+local overviewButtons = {}     -- the Group Overview buttons (green while the popup is open)
+do
+local applicantIlvl = {}     -- [Name-Realm] = item level seen on the applicant list
+local inspectIlvl = {}       -- [guid] = item level read by inspecting
+local applicantSpec = {}     -- [Name-Realm] = specID seen on the applicant list
+local inspectSpec = {}       -- [guid] = specID read by inspecting
+local inspectTried = {}      -- [guid] = when we last tried to inspect them
+local pendingInspect         -- guid of the inspect in progress
+local overview               -- the popup (created on first open)
+
+-- remember every applicant's item level, so we still know it once they have joined
+function CacheApplicantLevels()
+    local list = C_LFGList.GetApplicants()
+    if not list then return end
+    for _, id in ipairs(list) do
+        local a, _, _, d = C_LFGList.GetApplicantInfo(id)
+        local n = (type(a) == "table") and a.numMembers or d
+        if usable(n) and type(n) == "number" then
+            for idx = 1, n do
+                local ok, m = pcall(ApplicantMember, id, idx)
+                if ok and m and m.name then
+                    local key = NormalizeName(m.name)
+                    if key and m.itemLevel and m.itemLevel > 0 then applicantIlvl[key] = m.itemLevel end
+                    if key and m.specID and m.specID > 0 then applicantSpec[key] = m.specID end
+                end
+            end
+        end
+    end
+end
+
+-- everyone in your group (just you when solo)
+local function OverviewMembers()
+    local units = {}
+    if IsInRaid() then
+        for i = 1, GetNumGroupMembers() do units[#units + 1] = "raid" .. i end
+    elseif IsInGroup() then
+        units[1] = "player"
+        for i = 1, GetNumGroupMembers() - 1 do units[#units + 1] = "party" .. i end
+    else
+        units[1] = "player"
+    end
+
+    local out = {}
+    for _, unit in ipairs(units) do
+        if UnitExists(unit) then
+            local name = UnitName(unit)
+            local _, classFile = UnitClass(unit)
+            if usable(name) and name and usable(classFile) and classFile then
+                local isMe = UnitIsUnit(unit, "player")
+                local role = UnitGroupRolesAssigned(unit)
+                if (role == nil or role == "NONE") and isMe then
+                    local getSpec = (C_SpecializationInfo and C_SpecializationInfo.GetSpecialization) or GetSpecialization
+                    local getRole = (C_SpecializationInfo and C_SpecializationInfo.GetSpecializationRole) or GetSpecializationRole
+                    if getSpec and getRole then
+                        local spec = getSpec()
+                        role = spec and getRole(spec) or nil
+                    end
+                end
+                if not ROLE_ATLAS[role or ""] then role = "DAMAGER" end
+
+                local ilvl, specID
+                if isMe then
+                    local _, equipped = GetAverageItemLevel()
+                    ilvl = equipped
+                    local getSpec = (C_SpecializationInfo and C_SpecializationInfo.GetSpecialization) or GetSpecialization
+                    local getInfo = (C_SpecializationInfo and C_SpecializationInfo.GetSpecializationInfo) or GetSpecializationInfo
+                    local idx = getSpec and getSpec()
+                    if idx and getInfo then specID = getInfo(idx) end
+                else
+                    local fullName, realm = UnitFullName(unit)
+                    local key = usable(fullName) and fullName and NormalizeName(
+                        (usable(realm) and realm and realm ~= "") and (fullName .. "-" .. realm) or fullName)
+                    local guid = UnitGUID(unit) or ""
+                    ilvl = (key and applicantIlvl[key]) or inspectIlvl[guid]
+                    specID = (key and applicantSpec[key]) or inspectSpec[guid]
+                end
+                local spec
+                if type(specID) == "number" and usable(specID) and specID > 0 and GetSpecializationInfoByID then
+                    spec = select(2, GetSpecializationInfoByID(specID))
+                    if not (usable(spec) and type(spec) == "string") then spec = nil end
+                end
+                if not (type(ilvl) == "number" and usable(ilvl) and ilvl > 0) then ilvl = nil end
+                out[#out + 1] = { unit = unit, name = name, class = classFile, role = role, ilvl = ilvl, spec = spec }
+            end
+        end
+    end
+    return out
+end
+
+local function ClassName(file)
+    return (LOCALIZED_CLASS_NAMES_MALE and LOCALIZED_CLASS_NAMES_MALE[file]) or file
+end
+
+local function SortByIlvl(list)
+    table.sort(list, function(a, b)
+        if (a.ilvl or 0) ~= (b.ilvl or 0) then return (a.ilvl or 0) > (b.ilvl or 0) end
+        return a.name < b.name
+    end)
+end
+
+-- groups = { { title, sub, color, members } ... } for the chosen mode
+local function BuildOverviewGroups(members, mode)
+    local groups, byKey = {}, {}
+    local function Add(key, title, sub, color, m)
+        local g = byKey[key]
+        if not g then
+            g = { title = title, sub = sub, color = color, members = {} }
+            byKey[key] = g
+            groups[#groups + 1] = g
+        end
+        g.members[#g.members + 1] = m
+    end
+
+    if mode == "class" then
+        local files = {}
+        for _, m in ipairs(members) do files[m.class] = true end
+        local order = {}
+        for file in pairs(files) do order[#order + 1] = file end
+        table.sort(order, function(a, b) return ClassName(a) < ClassName(b) end)
+        for _, file in ipairs(order) do
+            local c = RAID_CLASS_COLORS and RAID_CLASS_COLORS[file]
+            byKey[file] = { title = ClassName(file), color = c and { c.r, c.g, c.b }, members = {} }
+            groups[#groups + 1] = byKey[file]
+        end
+        for _, m in ipairs(members) do table.insert(byKey[m.class].members, m) end
+    elseif mode == "tier" then
+        local order, classesOf = { "Woven", "Cured", "Cast", "Forged" }, {}
+        for file, token in pairs(TIER_TOKEN) do
+            classesOf[token] = classesOf[token] or {}
+            table.insert(classesOf[token], ClassName(file))
+        end
+        for _, token in ipairs(order) do
+            table.sort(classesOf[token] or {})
+            byKey[token] = { title = token, sub = table.concat(classesOf[token] or {}, ", "), members = {} }
+            groups[#groups + 1] = byKey[token]
+        end
+        for _, m in ipairs(members) do
+            local token = TIER_TOKEN[m.class]
+            if token then table.insert(byKey[token].members, m) else Add("none", "No tier set", nil, nil, m) end
+        end
+    elseif mode == "buff" then
+        local buffOf = {}
+        for _, b in ipairs(RAID_BUFFS) do buffOf[b.class] = b end
+        for _, b in ipairs(RAID_BUFFS) do
+            byKey[b.class] = { title = b.buff, sub = ClassName(b.class), members = {} }
+            groups[#groups + 1] = byKey[b.class]
+        end
+        for _, m in ipairs(members) do
+            if buffOf[m.class] then
+                table.insert(byKey[m.class].members, m)
+            else
+                Add("none", "No raid buff", nil, nil, m)
+            end
+        end
+    else   -- "ilvl": by role
+        local titles = { TANK = "Tanks", HEALER = "Healers", DAMAGER = "DPS" }
+        for _, role in ipairs({ "TANK", "HEALER", "DAMAGER" }) do
+            byKey[role] = { title = titles[role], members = {} }
+            groups[#groups + 1] = byKey[role]
+        end
+        for _, m in ipairs(members) do table.insert(byKey[m.role].members, m) end
+    end
+
+    -- drop empty groups, sort the rest by item level, work out the averages
+    local out = {}
+    for _, g in ipairs(groups) do
+        if #g.members > 0 then
+            SortByIlvl(g.members)
+            local sum, n = 0, 0
+            for _, m in ipairs(g.members) do
+                if m.ilvl then sum = sum + m.ilvl; n = n + 1 end
+            end
+            g.avg = n > 0 and (sum / n) or nil
+            out[#out + 1] = g
+        end
+    end
+    return out
+end
+
+local OVERVIEW_W, OVERVIEW_LINE = 296, 18
+local OVERVIEW_MODES = {
+    { key = "ilvl",  label = "Ilvl" },
+    { key = "class", label = "Class" },
+    { key = "tier",  label = "Tier Set" },
+    { key = "buff",  label = "Raid Buff" },
+}
+
+local function OverviewLine(i)
+    local l = overview.lines[i]
+    if l then return l end
+    l = CreateFrame("Frame", nil, overview.child)
+    l:SetSize(OVERVIEW_W, OVERVIEW_LINE)
+    l.bg = l:CreateTexture(nil, "BACKGROUND")
+    l.bg:SetAllPoints()
+    l.role = l:CreateTexture(nil, "ARTWORK")
+    l.role:SetSize(14, 14)
+    l.role:SetPoint("LEFT", 4, 0)
+    l.name = l:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    l.name:SetPoint("LEFT", 22, 0)
+    l.name:SetWidth(120)
+    l.name:SetJustifyH("LEFT")
+    l.class = l:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    l.class:SetPoint("LEFT", 146, 0)
+    l.class:SetWidth(90)
+    l.class:SetJustifyH("LEFT")
+    l.ilvl = l:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    l.ilvl:SetPoint("RIGHT", -6, 0)
+    l.ilvl:SetJustifyH("RIGHT")
+    l.head = l:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    l.head:SetPoint("LEFT", 6, 0)
+    l.head:SetJustifyH("LEFT")
+    -- member lines can be clicked to inspect that player
+    l:EnableMouse(true)
+    l.hl = l:CreateTexture(nil, "HIGHLIGHT")
+    l.hl:SetAllPoints()
+    l.hl:SetColorTexture(1, 0.82, 0, 0.12)
+    l:SetScript("OnMouseUp", function(self, button)
+        if button ~= "LeftButton" or not self.unit then return end
+        local unit = self.unit
+        if UnitGUID(unit) ~= self.guid then return end     -- the group changed
+        if not (UnitIsConnected(unit) and CanInspect(unit)) then
+            print("|cff33ff99BF:|r can't inspect " .. (UnitName(unit) or "that player") .. " (too far away or offline).")
+            return
+        end
+        local ok, err = pcall(InspectUnit, unit)
+        if not ok then print("|cff33ff99BF:|r couldn't inspect:", err) end
+    end)
+    l.sub = l:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    l.sub:SetJustifyH("LEFT")
+    l.sub:SetTextColor(0.6, 0.6, 0.6)
+    overview.lines[i] = l
+    return l
+end
+
+local function RefreshOverview()
+    if not (overview and overview:IsShown()) then return end
+    local mode = db.overviewMode
+    for _, b in ipairs(overview.modeButtons) do
+        b:SetState(b.key == mode and "sel" or "off", b.label)
+    end
+
+    local members = OverviewMembers()
+    local groups = BuildOverviewGroups(members, mode)
+
+    local n, y = 0, 0
+    -- height: how tall this line is (default one line)
+    local function Next(height)
+        n = n + 1
+        local l = OverviewLine(n)
+        height = height or OVERVIEW_LINE
+        l:ClearAllPoints()
+        l:SetPoint("TOPLEFT", overview.child, "TOPLEFT", 0, -y)
+        l:SetHeight(height)
+        l:Show()
+        y = y + height
+        -- reset what a line may have been used for before
+        l.head:ClearAllPoints()
+        l.head:SetPoint("LEFT", 6, 0)
+        l.head:SetWidth(OVERVIEW_W - 90)
+        l.head:SetWordWrap(false)
+        l.sub:Hide()
+        l.head:SetFontObject("GameFontNormal")
+        l.unit, l.guid = nil, nil
+        l.hl:SetShown(false)
+        l.ilvl:ClearAllPoints()
+        l.ilvl:SetPoint("RIGHT", -6, 0)
+        return l
+    end
+
+    -- Ilvl view starts with the average of everyone
+    if mode == "ilvl" then
+        local sum, known = 0, 0
+        for _, m in ipairs(members) do
+            if m.ilvl then sum = sum + m.ilvl; known = known + 1 end
+        end
+        local l = Next(26)
+        l.bg:SetColorTexture(1, 0.82, 0, 0.20)
+        l.role:Hide(); l.name:Hide(); l.class:Hide(); l.ilvl:Hide()
+        l.head:Show()
+        l.head:SetFontObject("GameFontNormal")
+        l.head:SetWidth(OVERVIEW_W - 12)
+        l.head:SetTextColor(1, 1, 1)
+        if known > 0 then
+            l.head:SetText(("Average item level: |cffffd100%d|r"):format(math.floor(sum / known + 0.5))
+                .. (known < #members and ("  |cff999999(%d/%d known)|r"):format(known, #members) or ""))
+        else
+            l.head:SetText("Average item level: |cffffd100?|r")
+        end
+    end
+
+    for _, g in ipairs(groups) do
+        -- a long note (the classes of a tier set) goes on a second row so it can't run into the average
+        local twoRows = g.sub and #g.sub > 14
+        local l = Next(twoRows and (OVERVIEW_LINE + 14) or nil)
+        l.bg:SetColorTexture(1, 0.82, 0, 0.12)
+        l.role:Hide(); l.name:Hide(); l.class:Hide()
+        l.head:Show()
+        local c = g.color
+        if c then l.head:SetTextColor(c[1], c[2], c[3]) else l.head:SetTextColor(1, 0.82, 0) end
+        if twoRows then
+            l.head:ClearAllPoints()
+            l.head:SetPoint("TOPLEFT", 6, -3)
+            l.head:SetText(("%s (%d)"):format(g.title, #g.members))
+            l.ilvl:ClearAllPoints()
+            l.ilvl:SetPoint("TOPRIGHT", -6, -4)
+            l.sub:ClearAllPoints()
+            l.sub:SetPoint("TOPLEFT", 6, -OVERVIEW_LINE - 1)
+            l.sub:SetWidth(OVERVIEW_W - 12)
+            l.sub:SetText(g.sub)
+            l.sub:Show()
+        else
+            l.head:SetText(("%s (%d)%s"):format(g.title, #g.members, g.sub and ("  |cff999999" .. g.sub .. "|r") or ""))
+        end
+        l.ilvl:SetTextColor(0.8, 0.8, 0.8)
+        l.ilvl:SetText(g.avg and ("avg %d"):format(math.floor(g.avg + 0.5)) or "")
+        l.ilvl:Show()
+        for _, m in ipairs(g.members) do
+            local r = Next()
+            r.bg:SetColorTexture(1, 1, 1, 0.03)
+            r.unit, r.guid = m.unit, UnitGUID(m.unit)
+            r.hl:SetShown(true)
+            r.head:Hide()
+            r.role:SetAtlas(ROLE_ATLAS[m.role]); r.role:Show()
+            local c2 = RAID_CLASS_COLORS and RAID_CLASS_COLORS[m.class]
+            r.name:SetTextColor(c2 and c2.r or 1, c2 and c2.g or 1, c2 and c2.b or 1)
+            r.name:SetText(m.name); r.name:Show()
+            r.class:SetTextColor(0.65, 0.65, 0.65)
+            r.class:SetText(m.spec or ClassName(m.class)); r.class:Show()
+            r.ilvl:SetTextColor(1, 1, 1)
+            r.ilvl:SetText(m.ilvl and ("%d"):format(math.floor(m.ilvl + 0.5)) or "?")
+            r.ilvl:Show()
+        end
+    end
+
+    -- Raid Buff view: say which buffs nobody brings
+    if mode == "buff" then
+        local missing = MissingBuffClasses()
+        local names = {}
+        for _, file in ipairs(missing) do
+            for _, b in ipairs(RAID_BUFFS) do
+                if b.class == file then names[#names + 1] = b.buff end
+            end
+        end
+        local l = Next()
+        l.bg:SetColorTexture(0.9, 0.2, 0.2, #names > 0 and 0.12 or 0)
+        l.role:Hide(); l.name:Hide(); l.class:Hide(); l.ilvl:Hide()
+        l.head:Show()
+        l.head:SetTextColor(1, 0.8, 0.8)
+        -- may need several lines: wrap it and make the line as tall as the text
+        l.head:ClearAllPoints()
+        l.head:SetPoint("TOPLEFT", 6, -4)
+        l.head:SetWidth(OVERVIEW_W - 12)
+        l.head:SetWordWrap(true)
+        l.head:SetText(#names > 0 and ("Missing: " .. table.concat(names, ", ")) or "Every raid buff is covered")
+        local h = math.max(OVERVIEW_LINE, math.ceil(l.head:GetStringHeight() or 0) + 10)
+        l:SetHeight(h)
+        y = y - OVERVIEW_LINE + h
+    end
+
+    for i = n + 1, #overview.lines do overview.lines[i]:Hide() end
+    if #members == 0 then
+        local l = Next()
+        l.bg:SetColorTexture(0, 0, 0, 0)
+        l.role:Hide(); l.name:Hide(); l.class:Hide(); l.ilvl:Hide()
+        l.head:Show(); l.head:SetTextColor(0.7, 0.7, 0.7); l.head:SetText("Nobody in your group.")
+    end
+
+    -- as tall as the content, up to what fits on screen below the window's top edge
+    local maxH = math.max(300, (UIParent:GetHeight() or 900) - 140 - 84 - 40)
+    overview.child:SetSize(OVERVIEW_W, math.max(y, 1))
+    overview:SetHeight(84 + math.min(y, maxH))
+    overview.scroll:SetVerticalScroll(math.min(overview.scroll:GetVerticalScroll(), math.max(0, y - maxH)))
+end
+
+-- read the item level of one group member we do not know yet (one at a time)
+local function InspectNext()
+    if not (overview and overview:IsShown()) or pendingInspect then return end
+    if InspectFrame and InspectFrame:IsShown() then return end
+    local now = GetTime()
+    for _, m in ipairs(OverviewMembers()) do
+        local guid = UnitGUID(m.unit)
+        if (not m.ilvl or not m.spec) and usable(guid) and guid and not UnitIsUnit(m.unit, "player")
+            and (not inspectTried[guid] or now - inspectTried[guid] > 30)
+            and UnitIsConnected(m.unit) and CanInspect(m.unit) then
+            inspectTried[guid] = now
+            pendingInspect = guid
+            NotifyInspect(m.unit)
+            C_Timer.After(3, function() if pendingInspect == guid then pendingInspect = nil end end)
+            return
+        end
+    end
+end
+
+local function CreateOverview()
+    overview = CreateFrame("Frame", "BetterFiltersOverview", UIParent)
+    overview:SetSize(OVERVIEW_W + 24, 200)
+    -- anchored by its top edge, so changing tabs grows and shrinks it downwards only
+    overview:SetPoint("TOP", UIParent, "TOP", 0, -140)
+    overview:SetFrameStrata("DIALOG")
+    overview:SetMovable(true)
+    overview:SetClampedToScreen(true)
+    overview:EnableMouse(true)
+    overview:RegisterForDrag("LeftButton")
+    overview:SetScript("OnDragStart", overview.StartMoving)
+    overview:SetScript("OnDragStop", function(self)
+        self:StopMovingOrSizing()
+        -- keep the top-left corner as the anchor wherever it was dropped
+        local left, top = self:GetLeft(), self:GetTop()
+        if left and top then
+            self:ClearAllPoints()
+            self:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", left, top)
+        end
+    end)
+    overview.lines = {}
+    overview:Hide()
+
+    local edge = overview:CreateTexture(nil, "BACKGROUND", nil, -2)
+    edge:SetPoint("TOPLEFT", -1, 1)
+    edge:SetPoint("BOTTOMRIGHT", 1, -1)
+    edge:SetColorTexture(unpack(THEME.border))
+    local bg = overview:CreateTexture(nil, "BACKGROUND", nil, -1)
+    bg:SetAllPoints()
+    bg:SetColorTexture(unpack(THEME.bg))
+
+    local title = overview:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    title:SetPoint("TOP", overview, "TOP", 0, -9)
+    title:SetText("Group Overview")
+
+    local close = MakeToggleButton(overview, 0, 0, 20)
+    close:SetHeight(18)
+    close:ClearAllPoints()
+    close:SetPoint("TOPRIGHT", overview, "TOPRIGHT", -8, -8)
+    close:SetState("no", "x")
+    close:SetScript("OnClick", function() overview:Hide() end)
+
+    local divider = overview:CreateTexture(nil, "ARTWORK")
+    divider:SetColorTexture(unpack(THEME.border))
+    divider:SetHeight(1)
+    divider:SetPoint("TOPLEFT", overview, "TOPLEFT", 0, -32)
+    divider:SetPoint("TOPRIGHT", overview, "TOPRIGHT", 0, -32)
+
+    -- how to group
+    overview.modeButtons = {}
+    local gap = 4
+    local w = (OVERVIEW_W - gap * (#OVERVIEW_MODES - 1)) / #OVERVIEW_MODES
+    for i, mode in ipairs(OVERVIEW_MODES) do
+        local b = MakeToggleButton(overview, 12 + (i - 1) * (w + gap), -42, w)
+        b.key, b.label = mode.key, mode.label
+        b:SetScript("OnClick", function()
+            db.overviewMode = mode.key
+            RefreshOverview()
+        end)
+        overview.modeButtons[#overview.modeButtons + 1] = b
+    end
+
+    overview.scroll = CreateFrame("ScrollFrame", nil, overview)
+    overview.scroll:SetPoint("TOPLEFT", overview, "TOPLEFT", 12, -74)
+    overview.scroll:SetPoint("BOTTOMRIGHT", overview, "BOTTOMRIGHT", -12, 10)
+    overview.child = CreateFrame("Frame", nil, overview.scroll)
+    overview.child:SetSize(OVERVIEW_W, 1)
+    overview.scroll:SetScrollChild(overview.child)
+    overview.scroll:EnableMouseWheel(true)
+    overview.scroll:SetScript("OnMouseWheel", function(self, delta)
+        local max = math.max(0, overview.child:GetHeight() - self:GetHeight())
+        self:SetVerticalScroll(math.max(0, math.min(max, self:GetVerticalScroll() - delta * OVERVIEW_LINE * 2)))
+    end)
+
+    local function UpdateButtons()
+        for _, b in ipairs(overviewButtons) do
+            b:SetState(overview:IsShown() and "yes" or "off", "Group Overview")
+        end
+    end
+    overview:SetScript("OnShow", function()
+        UpdateButtons()
+        RefreshOverview()
+        InspectNext()
+    end)
+    overview:HookScript("OnHide", UpdateButtons)
+    local elapsed = 0
+    overview:SetScript("OnUpdate", function(_, dt)
+        elapsed = elapsed + dt
+        if elapsed > 2.5 then
+            elapsed = 0
+            pcall(InspectNext)
+        end
+    end)
+    overview:RegisterEvent("GROUP_ROSTER_UPDATE")
+    overview:RegisterEvent("INSPECT_READY")
+    overview:SetScript("OnEvent", function(_, event, guid)
+        if event == "INSPECT_READY" then
+            if guid and guid == pendingInspect then
+                pendingInspect = nil
+                for _, m in ipairs(OverviewMembers()) do
+                    if UnitGUID(m.unit) == guid then
+                        local ilvl = C_PaperDollInfo and C_PaperDollInfo.GetInspectItemLevel
+                            and C_PaperDollInfo.GetInspectItemLevel(m.unit)
+                        if type(ilvl) == "number" and usable(ilvl) and ilvl > 0 then inspectIlvl[guid] = ilvl end
+                        local specID = GetInspectSpecialization and GetInspectSpecialization(m.unit)
+                        if type(specID) == "number" and usable(specID) and specID > 0 then inspectSpec[guid] = specID end
+                        break
+                    end
+                end
+                if ClearInspectPlayer then ClearInspectPlayer() end
+            end
+        end
+        pcall(RefreshOverview)
+    end)
+    tinsert(UISpecialFrames, "BetterFiltersOverview")
+end
+
+function ToggleOverview()
+    if not overview then CreateOverview() end
+    overview:SetShown(not overview:IsShown())
+end
+end   -- Group Overview
 
 -- kind = "dungeon" or "raid"; the raid panel has no Fit my group and no rating
 local function BuildApplicantPanel(kind)
@@ -3368,6 +3893,21 @@ local function BuildApplicantPanel(kind)
     summary:SetPoint("CENTER", panelF, "TOPLEFT", COL2 + 52, y - 11)
     summary:SetText("")
     appSummaries[kind] = summary
+    y = y - ROW_STEP
+
+    -- Group Overview: your group or raid regrouped by item level / class / tier / buff
+    local ovButton = MakeToggleButton(panelF, LEFT, y, WIDTH)
+    local ov = _G.BetterFiltersOverview
+    ovButton:SetState(ov and ov:IsShown() and "yes" or "off", "Group Overview")
+    overviewButtons[#overviewButtons + 1] = ovButton
+    ovButton:SetScript("OnClick", function() pcall(ToggleOverview) end)
+    ovButton:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Group Overview")
+        GameTooltip:AddLine("Shows your group or raid by item level, class, tier set or raid buff.", 1, 1, 1, true)
+        GameTooltip:Show()
+    end)
+    ovButton:SetScript("OnLeave", GameTooltip_Hide)
     y = y - ROW_H - SECTION
 
     -- Role
@@ -3673,6 +4213,7 @@ local function InstallApplicantHooks()
     end
     if LFGListApplicationViewer_UpdateResults then
         hooksecurefunc("LFGListApplicationViewer_UpdateResults", function(self)
+            pcall(CacheApplicantLevels)
             pcall(ApplyApplicantFilter, self)
         end)
     else
