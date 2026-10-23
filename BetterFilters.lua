@@ -35,6 +35,7 @@ local defaults = {
     raidDpsMin = 0,    raidDpsMax = RAID_DPS_MAX,
     partyFit   = false,         -- only show groups with room for my party's roles
     instantSignUp = true,       -- clicking a listing signs up straight away
+    signUpRoles = {},           -- [classFile] = "TANK"|"HEALER"|"DAMAGER": role you sign up as
     signUpNote = "",            -- text put in the note box when you sign up to a group
     dungeons   = {},            -- [challengeMapID] = 1 (include) or 2 (exclude)
     notes      = {},            -- [leader name] = { color = "green"|"red", text = "..." }
@@ -64,6 +65,7 @@ local db
 local panel                    -- our UI panel (created once the LFG UI exists)
 local appPanel                 -- the applicant filter panel (while you have a dungeon listing up)
 local appRaidPanel             -- the applicant filter panel for a raid listing
+local ApplyPreferredRole       -- sets the role boxes of the sign-up dialog (defined further down)
 local initialized = false
 
 -- The panel and the filters only work on the Dungeons category of Premade Groups
@@ -679,6 +681,7 @@ local function InstallHooks()
     local autoConfirm = false
 
     hooksecurefunc("LFGListApplicationDialog_Show", function(dialog)
+        if ApplyPreferredRole then pcall(ApplyPreferredRole, dialog) end
         if not autoConfirm then return end
         local button = dialog and dialog.SignUpButton
         if button and button:IsEnabled() then
@@ -1579,12 +1582,56 @@ local function UpdateRaidClassCount(entry)
     fs:Show()
 end
 
+-- The role you signed up as, shown to the left of the timer on rows you applied to
+local appliedRole = {}           -- [resultID] = role of your application, as sent
+local ROLE_ATLAS = { TANK = "roleicon-tiny-tank", HEALER = "roleicon-tiny-healer", DAMAGER = "roleicon-tiny-dps" }
+
+local function UpdateRoleIcon(entry)
+    local icon = entry.BFRoleIcon
+    local function Off() if icon then icon:Hide() end end
+
+    local timer = entry.ExpirationTime
+    local resultID = entry.resultID
+    if not (resultID and usable(resultID) and timer and timer:IsShown()) then return Off() end
+
+    local _, _, _, _, role = C_LFGList.GetApplicationInfo(resultID)
+    if not (usable(role) and role and ROLE_ATLAS[role]) then role = appliedRole[resultID] end
+    if not (role and ROLE_ATLAS[role]) then return Off() end
+
+    if not icon then
+        icon = entry:CreateTexture(nil, "OVERLAY")
+        icon:SetSize(16, 16)
+        entry.BFRoleIcon = icon
+    end
+    icon:SetAtlas(ROLE_ATLAS[role])
+    -- sit just left of the timer's text, even if the text box is wider than the text
+    local extra = 0
+    local boxW, textW = timer:GetWidth(), timer:GetStringWidth()
+    if usable(boxW) and usable(textW) and type(boxW) == "number" and type(textW) == "number"
+        and boxW > textW and timer:GetJustifyH() == "RIGHT" then
+        extra = boxW - textW
+    end
+    icon:ClearAllPoints()
+    icon:SetPoint("RIGHT", timer, "LEFT", -4 + extra, 0)
+    icon:Show()
+end
+
 local function InstallSpecHooks()
     if LFGListSearchEntry_Update then
         hooksecurefunc("LFGListSearchEntry_Update", function(entry)
             pcall(UpdateSpecIcons, entry)
             pcall(UpdateRaidComp, entry)
             pcall(UpdateRaidClassCount, entry)
+            pcall(UpdateRoleIcon, entry)
+        end)
+    end
+    -- remember the role each application was sent with (the game may not tell us later)
+    if C_LFGList and C_LFGList.ApplyToGroup then
+        hooksecurefunc(C_LFGList, "ApplyToGroup", function(resultID, tank, healer, dps)
+            pcall(function()
+                if not usable(resultID) then return end
+                appliedRole[resultID] = (tank and "TANK") or (healer and "HEALER") or (dps and "DAMAGER") or nil
+            end)
         end)
     end
 end
@@ -2332,6 +2379,94 @@ end
 ---------------------------------------------------------------------------
 
 ---------------------------------------------------------------------------
+-- Sign up as: pick the role you sign up with
+---------------------------------------------------------------------------
+
+-- the roles each class can play (only classes with more than one get buttons)
+local CLASS_ROLES = {
+    WARRIOR = { "TANK", "DAMAGER" },
+    PALADIN = { "TANK", "HEALER", "DAMAGER" },
+    DEATHKNIGHT = { "TANK", "DAMAGER" },
+    DEMONHUNTER = { "TANK", "DAMAGER" },
+    DRUID = { "TANK", "HEALER", "DAMAGER" },
+    MONK = { "TANK", "HEALER", "DAMAGER" },
+    PRIEST = { "HEALER", "DAMAGER" },
+    SHAMAN = { "HEALER", "DAMAGER" },
+    EVOKER = { "HEALER", "DAMAGER" },
+}
+local ROLE_LABELS = { TANK = "Tank", HEALER = "Healer", DAMAGER = "DPS" }
+local ROLE_BUTTON_FIELDS = { TANK = "TankButton", HEALER = "HealerButton", DAMAGER = "DamagerButton" }
+local roleButtons = {}            -- the role buttons of every panel (kept in step)
+
+local function PlayerRoleList()
+    local _, file = UnitClass("player")
+    return file and CLASS_ROLES[file] or nil, file
+end
+
+-- the role you chose for this class, or nil
+local function SelectedRole()
+    local list, file = PlayerRoleList()
+    local role = file and db.signUpRoles[file]
+    if list and role then
+        for _, r in ipairs(list) do
+            if r == role then return role end
+        end
+    end
+    return nil
+end
+
+local function RefreshRoleButtons()
+    local role = SelectedRole()
+    for _, b in ipairs(roleButtons) do
+        b:SetState(b.role == role and "yes" or "off", ROLE_LABELS[b.role])
+    end
+end
+
+-- Makes the Tank / Healer / DPS buttons at (x, y). Returns true if the class has a choice.
+local function MakeRoleButtons(parent, x, y, width)
+    local list = PlayerRoleList()
+    if not list or #list < 2 then return false end
+    local gap = 4
+    local w = (width - gap * (#list - 1)) / #list
+    for i, role in ipairs(list) do
+        local b = MakeToggleButton(parent, x + (i - 1) * (w + gap), y, w)
+        b.role = role
+        b:SetScript("OnClick", function()
+            local _, file = PlayerRoleList()
+            if not file then return end
+            db.signUpRoles[file] = (db.signUpRoles[file] ~= role) and role or nil
+            RefreshRoleButtons()
+        end)
+        b:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText("Sign up as " .. ROLE_LABELS[role])
+            GameTooltip:AddLine("Click again to go back to the game's own choice.", 1, 1, 1, true)
+            GameTooltip:Show()
+        end)
+        b:SetScript("OnLeave", GameTooltip_Hide)
+        roleButtons[#roleButtons + 1] = b
+    end
+    RefreshRoleButtons()
+    return true
+end
+
+-- tick only the chosen role in the sign-up dialog (runs each time the dialog opens)
+function ApplyPreferredRole(dialog)
+    local role = SelectedRole()
+    if not (role and dialog) then return end
+    local chosen = dialog[ROLE_BUTTON_FIELDS[role]]
+    local chosenBox = chosen and chosen.CheckButton
+    if not chosenBox then return end
+    for r, field in pairs(ROLE_BUTTON_FIELDS) do
+        local box = dialog[field] and dialog[field].CheckButton
+        if box then box:SetChecked(r == role) end
+    end
+    if LFGListApplicationDialog_UpdateValidState then
+        LFGListApplicationDialog_UpdateValidState(dialog)
+    end
+end
+
+---------------------------------------------------------------------------
 -- Your keystone: a button that shows it and lists it as a group
 ---------------------------------------------------------------------------
 
@@ -2476,6 +2611,13 @@ local function BuildPanel()
     local noteY = y
     MakeSignUpNoteBox(panel, LEFT, y, WIDTH)
     y = y - ROW_H - SECTION
+    -- Sign up as: Tank / Healer / DPS (only for classes that can play more than one)
+    y = y + SECTION - 4
+    if MakeRoleButtons(panel, LEFT, y, WIDTH) then
+        y = y - ROW_H - SECTION
+    else
+        y = y - SECTION + 4
+    end
 
     -- Playstyle -------------------------------------------------------------
     MakeLabel(panel, "Playstyle", LEFT, y)
@@ -2682,6 +2824,12 @@ local function BuildRaidPanel()
     local noteY = y
     MakeSignUpNoteBox(p, LEFT, y, WIDTH)
     y = y - ROW_H - SECTION
+    y = y + SECTION - 4
+    if MakeRoleButtons(p, LEFT, y, WIDTH) then
+        y = y - ROW_H - SECTION
+    else
+        y = y - SECTION + 4
+    end
 
     -- Playstyle (its own settings, separate from the dungeon panel) -------------------
     MakeLabel(p, "Playstyle", LEFT, y)

@@ -2,7 +2,7 @@
 
 A World of Warcraft (Retail) addon that adds clean, flat filter panels next to the **Premade Groups** (Group Finder) window. There are panels for finding **Dungeon** and **Raid** groups, and separate panels for filtering the **applicants to your own listing**. It also adds instant sign-up, a sign-up note box, per-player notes with chat alerts, spec icons, a keystone button, and a tidier layout for groups you have applied to.
 
-> Interface version: `120005` · Addon version: `0.8.0` · Saved variables: `BetterFiltersDB`
+> Interface version: `120100` · Addon version: `0.8.0` · Saved variables: `BetterFiltersDB`
 
 ---
 
