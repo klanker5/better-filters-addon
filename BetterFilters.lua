@@ -4356,6 +4356,9 @@ SlashCmdList["BETTERFILTERS"] = function(msg)
     if (msg or ""):lower():match("^debug") then
         local ok, err = pcall(DebugDump)
         if not ok then print("|cff33ff99BF:|r debug error:", err) end
+    elseif (msg or ""):lower():match("^g") then
+        local ok, err = pcall(ToggleOverview)
+        if not ok then print("|cff33ff99BF:|r overview error:", err) end
     elseif (msg or ""):lower():match("^app") then
         local ok, err = pcall(DebugApp)
         if not ok then print("|cff33ff99BF:|r app error:", err) end
@@ -4363,7 +4366,7 @@ SlashCmdList["BETTERFILTERS"] = function(msg)
         local ok, err = pcall(DebugSpec)
         if not ok then print("|cff33ff99BF:|r spec error:", err) end
     else
-        print("|cff33ff99BF:|r use '/bf debug' or '/bf spec' to inspect what listing data the game exposes.")
+        print("|cff33ff99BF:|r use '/bf g' to open the group overview, or '/bf debug' / '/bf spec' to inspect what listing data the game exposes.")
     end
 end
 
