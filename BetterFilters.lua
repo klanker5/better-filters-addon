@@ -35,7 +35,9 @@ local defaults = {
     raidDpsMin = 0,    raidDpsMax = RAID_DPS_MAX,
     partyFit   = false,         -- only show groups with room for my party's roles
     instantSignUp = true,       -- clicking a listing signs up straight away
-    overviewMode = "ilvl",     -- Group Overview: "ilvl" | "class" | "tier" | "buff"
+    overviewMode = "ilvl",     -- Group Overview: "ilvl" | "class" | "tier" | "buff" | "prog"
+    overviewRaid = 0,          -- Group Overview, Progress view: Raider.IO id of the raid shown
+    reskin = true,              -- restyle the Dungeons & Raids window and put our panels inside it
     signUpRoles = {},           -- [classFile] = "TANK"|"HEALER"|"DAMAGER": role you sign up as
     signUpNote = "",            -- text put in the note box when you sign up to a group
     dungeons   = {},            -- [challengeMapID] = 1 (include) or 2 (exclude)
@@ -67,6 +69,7 @@ local panel                    -- our UI panel (created once the LFG UI exists)
 local appPanel                 -- the applicant filter panel (while you have a dungeon listing up)
 local appRaidPanel             -- the applicant filter panel for a raid listing
 local ApplyPreferredRole       -- sets the role boxes of the sign-up dialog (defined further down)
+local InstallSkin, DumpFrames  -- the window skin and its debug dump (defined further down)
 local initialized = false
 
 -- The panel and the filters only work on the Dungeons category of Premade Groups
@@ -1188,6 +1191,9 @@ local function CreateRangeSlider(parent, x, y, width, cfg)
     return s
 end
 
+-- (kept inside a do-block: the game allows at most 200 top-level locals per file)
+local SpecIconFor, TIER_TOKEN, ROLE_ATLAS, InstallSpecHooks
+do
 ---------------------------------------------------------------------------
 -- Spec icons: replace the class-coloured role icons on dungeon listings
 ---------------------------------------------------------------------------
@@ -1219,7 +1225,7 @@ local function BuildSpecIcons()
 end
 
 -- icon for a member, from the class file ("WARRIOR") and the localized spec name ("Fury")
-local function SpecIconFor(classFile, specName)
+function SpecIconFor(classFile, specName)
     if not specIconCache then BuildSpecIcons() end
     return specIconCache[classFile .. ":" .. Normalize(specName)]
 end
@@ -1504,7 +1510,7 @@ end
 -- Raids: how many players of your own class are already in each group, shown on the
 -- playstyle line as "[class icon] 3", under the tank / healer / dps numbers
 -- Midnight tier tokens are shared by armor type
-local TIER_TOKEN = {
+TIER_TOKEN = {
     MAGE = "Woven", PRIEST = "Woven", WARLOCK = "Woven",
     DEMONHUNTER = "Cured", DRUID = "Cured", MONK = "Cured", ROGUE = "Cured",
     EVOKER = "Cast", HUNTER = "Cast", SHAMAN = "Cast",
@@ -1585,7 +1591,7 @@ end
 
 -- The role you signed up as, shown to the left of the timer on rows you applied to
 local appliedRole = {}           -- [resultID] = role of your application, as sent
-local ROLE_ATLAS = { TANK = "roleicon-tiny-tank", HEALER = "roleicon-tiny-healer", DAMAGER = "roleicon-tiny-dps" }
+ROLE_ATLAS = { TANK = "roleicon-tiny-tank", HEALER = "roleicon-tiny-healer", DAMAGER = "roleicon-tiny-dps" }
 
 local function UpdateRoleIcon(entry)
     local icon = entry.BFRoleIcon
@@ -1617,7 +1623,7 @@ local function UpdateRoleIcon(entry)
     icon:Show()
 end
 
-local function InstallSpecHooks()
+function InstallSpecHooks()
     if LFGListSearchEntry_Update then
         hooksecurefunc("LFGListSearchEntry_Update", function(entry)
             pcall(UpdateSpecIcons, entry)
@@ -1636,7 +1642,11 @@ local function InstallSpecHooks()
         end)
     end
 end
+end   -- spec icons and raid counts
 
+-- (kept inside a do-block: the game allows at most 200 top-level locals per file)
+local NormalizeName, CheckGroupNotes, InstallNoteHooks, MakeNotesButton
+do
 ---------------------------------------------------------------------------
 -- Notes: right-click a group -> add a good (green) or bad (red) note to its leader
 ---------------------------------------------------------------------------
@@ -1663,7 +1673,7 @@ local menuFallbackShown = false
 -- Notes are stored under "Name-Realm". A name without a realm is one of ours,
 -- and spaces in realm names are dropped ("Tarren Mill" -> "TarrenMill"), so the
 -- same player always gets the same key wherever we meet them.
-local function NormalizeName(name)
+function NormalizeName(name)
     if not usable(name) or type(name) ~= "string" or name == "" then return nil end
     local base, realm = name:match("^([^%-]+)%-(.+)$")
     if not base then
@@ -1888,7 +1898,7 @@ local function AlertNote(key, note, joined)
 end
 
 -- Compares the group with last time. silent = just remember who is here.
-local function CheckGroupNotes(silent)
+function CheckGroupNotes(silent)
     if not db then return end
     local current = GroupMemberKeys()
     local groupedNow = IsInGroup()
@@ -1910,7 +1920,7 @@ local function CheckGroupNotes(silent)
     wasGrouped = groupedNow
 end
 
-local function InstallNoteHooks()
+function InstallNoteHooks()
     -- the coloured bar
     if LFGListSearchEntry_Update then
         hooksecurefunc("LFGListSearchEntry_Update", function(entry)
@@ -2204,7 +2214,7 @@ local function ToggleNotesPanel(anchor)
 end
 
 -- The "Notes" button that sits in the top row of a filter panel.
-local function MakeNotesButton(parentPanel, x, y)
+function MakeNotesButton(parentPanel, x, y)
     local button = MakeToggleButton(parentPanel, x, y, 104)
     button.ownerPanel = parentPanel
     notesButtons[#notesButtons + 1] = button
@@ -2219,6 +2229,7 @@ local function MakeNotesButton(parentPanel, x, y)
     UpdateNotesButton()
     return button
 end
+end   -- notes
 
 ---------------------------------------------------------------------------
 -- Dungeon quick-filter buttons
@@ -3491,6 +3502,14 @@ local function BuildOverviewGroups(members, mode)
                 Add("none", "No raid buff", nil, nil, m)
             end
         end
+    elseif mode == "prog" then
+        for _, m in ipairs(members) do
+            if m.pkey then
+                Add(m.pkey, m.ptitle, nil, m.pcolor, m)
+                byKey[m.pkey].rank = m.prank
+            end
+        end
+        table.sort(groups, function(a, b) return (a.rank or 0) > (b.rank or 0) end)
     else   -- "ilvl": by role
         local titles = { TANK = "Tanks", HEALER = "Healers", DAMAGER = "DPS" }
         for _, role in ipairs({ "TANK", "HEALER", "DAMAGER" }) do
@@ -3516,12 +3535,333 @@ local function BuildOverviewGroups(members, mode)
     return out
 end
 
-local OVERVIEW_W, OVERVIEW_LINE = 296, 18
+-- Progress view: raid progress of the group, from Raider.IO (kills per boss and difficulty)
+-- and from the game's own achievements (Ahead of the Curve / Cutting Edge) when in range
+local PG = { ach = {}, tried = {}, bosses = {}, bossTries = {}, raids = {}, cur = nil, pending = nil }
+_G.BetterFiltersPG = PG
+
+local DIFF_LETTER = { [1] = "N", [2] = "H", [3] = "M" }
+local DIFF_NAME = { [1] = "Normal", [2] = "Heroic", [3] = "Mythic" }
+local DIFF_COLOR = { [1] = "1eff00", [2] = "a335ee", [3] = "ff8000" }
+
+function PG.Profile(unit)
+    local rio = _G.RaiderIO
+    if not (rio and rio.GetProfile) then return nil end
+    local ok, res = pcall(rio.GetProfile, unit)
+    if ok and type(res) == "table" and type(res.raidProfile) == "table" then return res.raidProfile end
+end
+
+local function EachRaidEntry(profile, fn)
+    for _, key in ipairs({ "progress", "mainProgress" }) do
+        local list = profile[key]
+        if type(list) == "table" then
+            for _, e in ipairs(list) do
+                if type(e) == "table" and type(e.raid) == "table" and e.raid.id then fn(e) end
+            end
+        end
+    end
+end
+
+-- boss names of a raid from the Encounter Journal (Raider.IO lists kills in that order).
+-- The journal functions have moved around between game versions: try each way.
+local function JournalInstance(mapId)
+    local list = {
+        C_EncounterJournal and C_EncounterJournal.GetInstanceForGameMap or false,
+        _G.EJ_GetInstanceForMap or false,
+    }
+    for i = 1, 2 do
+        local fn = list[i]
+        if fn then
+            local ok, id = pcall(fn, mapId)
+            if ok and type(id) == "number" and id > 0 then return id end
+        end
+    end
+end
+
+local function JournalBossName(index, instanceID, selected)
+    local list = {
+        C_EncounterJournal and C_EncounterJournal.GetEncounterInfoByIndex or false,
+        _G.EJ_GetEncounterInfoByIndex or false,
+    }
+    for i = 1, 2 do
+        local fn = list[i]
+        if fn then
+            -- with the instance given, or (once it is selected) without
+            local ok, a = pcall(fn, index, instanceID)
+            if ok then
+                if type(a) == "string" and a ~= "" then return a end
+                if type(a) == "table" and type(a.name) == "string" and a.name ~= "" then return a.name end
+            end
+            if selected then
+                ok, a = pcall(fn, index)
+                if ok and type(a) == "string" and a ~= "" then return a end
+            end
+        end
+    end
+end
+
+function PG.Bosses(raid)
+    local cached = PG.bosses[raid.id]
+    if cached then return cached end
+    local ej = raid.mapId and JournalInstance(raid.mapId)
+    local names, real = {}, true
+    local selected = false
+    for i = 1, raid.bossCount or 0 do
+        local name = ej and JournalBossName(i, ej, selected)
+        if ej and not name and not selected and _G.EJ_SelectInstance then
+            -- some versions only answer for the journal's selected instance
+            selected = pcall(EJ_SelectInstance, ej)
+            if selected then name = JournalBossName(i, ej, true) end
+        end
+        if not name then real = false end
+        names[i] = name or ("Boss " .. i)
+    end
+    PG.bossTries[raid.id] = (PG.bossTries[raid.id] or 0) + 1
+    if real or PG.bossTries[raid.id] >= 3 then PG.bosses[raid.id] = names end
+    return names
+end
+
+-- Every Ahead of the Curve / Cutting Edge achievement the game has. Going through all the
+-- achievements takes a couple of seconds, so it is done a little at a time in the
+-- background (and kept in the saved variables until the game updates).
+local ACHIEVEMENT_ROOT = 168      -- the "Dungeons & Raids" achievement category
+
+local function UnderRoot(cat)
+    local guard = 0
+    while cat and cat > 0 and guard < 10 do
+        if cat == ACHIEVEMENT_ROOT then return true end
+        local _, parent = GetCategoryInfo(cat)
+        cat = parent
+        guard = guard + 1
+    end
+    return false
+end
+
+function PG.StartScan()
+    if PG.scanning or not (GetCategoryList and GetCategoryNumAchievements and GetAchievementInfo and GetCategoryInfo) then return end
+    PG.scanning = true
+    local cats, all = {}, GetCategoryList()
+    for _, cat in ipairs(all) do
+        if UnderRoot(cat) then cats[#cats + 1] = cat end
+    end
+    if #cats == 0 then cats = all end       -- the root category was not found: look everywhere
+    local list, ci, ai, n = {}, 1, 1, nil
+    local function Step()
+        local start = debugprofilestop()
+        while ci <= #cats do
+            local cat = cats[ci]
+            n = n or (GetCategoryNumAchievements(cat) or 0)
+            while ai <= n do
+                local id, name = GetAchievementInfo(cat, ai)
+                if id and type(name) == "string" then
+                    if name:find("Ahead of the Curve", 1, true) then list[#list + 1] = { id = id, name = name, kind = "aotc" }
+                    elseif name:find("Cutting Edge", 1, true) then list[#list + 1] = { id = id, name = name, kind = "ce" } end
+                end
+                ai = ai + 1
+                if debugprofilestop() - start > 6 then
+                    C_Timer.After(0, Step)
+                    return
+                end
+            end
+            ci, ai, n = ci + 1, 1, nil
+        end
+        PG.list = list
+        PG.scanning = false
+        db.achList = { build = select(2, GetBuildInfo()), list = list }
+        if PG.refresh then pcall(PG.refresh) end
+    end
+    C_Timer.After(0, Step)
+end
+
+function PG.AchList()
+    if PG.list then return PG.list end
+    local saved = db.achList
+    if type(saved) == "table" and saved.build == select(2, GetBuildInfo()) and type(saved.list) == "table" and #saved.list > 0 then
+        PG.list = saved.list
+        return PG.list
+    end
+    PG.StartScan()
+    return {}
+end
+
+-- the two achievements of a raid: they are named after its last boss
+function PG.AchFor(raid)
+    local names = PG.Bosses(raid)
+    local last = names[#names]
+    local aotc, ce
+    if last and not last:match("^Boss %d+$") then
+        for _, a in ipairs(PG.AchList()) do
+            if a.name:sub(-(#last + 2)) == ": " .. last then
+                if a.kind == "aotc" then aotc = a.id else ce = a.id end
+            end
+        end
+    end
+    return aotc, ce
+end
+
+local function Done(id)
+    local _, _, _, completed = GetAchievementInfo(id)
+    return completed and true or false
+end
+
+-- work out, for the chosen raid, what each member has done and which group they belong in
+function PG.Prepare(members)
+    local byId, raids = {}, {}
+    local anyProfile = false
+    for _, m in ipairs(members) do
+        m.rp = PG.Profile(m.unit)
+        if m.rp then
+            anyProfile = true
+            EachRaidEntry(m.rp, function(e)
+                local r = e.raid
+                if not byId[r.id] then
+                    byId[r.id] = { id = r.id, name = r.name or ("Raid " .. r.id), ordinal = r.ordinal or 99,
+                        bossCount = r.bossCount or 0, mapId = r.mapId, shortName = r.shortName }
+                    raids[#raids + 1] = byId[r.id]
+                end
+            end)
+        end
+    end
+    table.sort(raids, function(a, b)
+        if a.ordinal ~= b.ordinal then return a.ordinal < b.ordinal end
+        return a.name < b.name
+    end)
+    PG.raids = raids
+    local raid = byId[db.overviewRaid or 0] or raids[1]
+    PG.cur = nil
+    if not raid then return nil, anyProfile end
+
+    local aotcID, ceID = PG.AchFor(raid)
+    PG.cur = { raid = raid, aotc = aotcID, ce = ceID }
+
+    for _, m in ipairs(members) do
+        local diffs = {}
+        if m.rp then
+            EachRaidEntry(m.rp, function(e)
+                if e.raid.id == raid.id and e.difficulty then
+                    local cur = diffs[e.difficulty]
+                    local kills = e.progressCount or 0
+                    if not cur then
+                        diffs[e.difficulty] = { kills = kills, per = e.killsPerBoss }
+                    else
+                        if kills > cur.kills then cur.kills = kills end
+                        if not cur.per and e.killsPerBoss then cur.per = e.killsPerBoss end
+                    end
+                end
+            end)
+        end
+        m.diffs = diffs
+
+        local state = PG.ach[UnitGUID(m.unit) or ""]
+        local isMe = UnitIsUnit(m.unit, "player")
+        m.aotc = aotcID and ((isMe and Done(aotcID)) or (state and state[aotcID])) or false
+        m.ce = ceID and ((isMe and Done(ceID)) or (state and state[ceID])) or false
+        m.achKnown = isMe or (state ~= nil)
+
+        local function K(d) return diffs[d] and diffs[d].kills or 0 end
+        local total = raid.bossCount
+        if m.ce then
+            m.pkey, m.ptitle, m.prank, m.pcolor = "ce", "Cutting Edge", 1000, { 1, 0.5, 0 }
+        elseif K(3) > 0 then
+            m.pkey, m.ptitle, m.prank, m.pcolor = "m" .. K(3), ("Mythic %d/%d"):format(K(3), total), 900 + K(3), { 1, 0.5, 0 }
+        elseif m.aotc then
+            m.pkey, m.ptitle, m.prank, m.pcolor = "aotc", "Ahead of the Curve", 800, { 0.64, 0.21, 0.93 }
+        elseif K(2) > 0 then
+            m.pkey, m.ptitle, m.prank, m.pcolor = "h" .. K(2), ("Heroic %d/%d"):format(K(2), total), 700 + K(2), { 0.64, 0.21, 0.93 }
+        elseif K(1) > 0 then
+            m.pkey, m.ptitle, m.prank, m.pcolor = "n" .. K(1), ("Normal %d/%d"):format(K(1), total), 600 + K(1), { 0.12, 1, 0 }
+        elseif m.rp then
+            m.pkey, m.ptitle, m.prank = "none", "No progress", 100
+        else
+            m.pkey, m.ptitle, m.prank = "nodata", "No Raider.IO data", 50
+        end
+
+        local parts = {}
+        for d = 3, 1, -1 do
+            if K(d) > 0 then parts[#parts + 1] = ("|cff%s%s %d/%d|r"):format(DIFF_COLOR[d], DIFF_LETTER[d], K(d), total) end
+        end
+        m.psummary = table.concat(parts, "  ")
+        local tags = {}
+        if m.ce then tags[#tags + 1] = "|cffff8000CE|r" end
+        if m.aotc then tags[#tags + 1] = "|cffa335eeAotC|r" end
+        m.ptags = table.concat(tags, " ")
+    end
+    return raid, anyProfile
+end
+
+-- one achievement-comparison read at a time, like the item level inspects
+function PG.NextAch()
+    if not (overview and overview:IsShown()) or db.overviewMode ~= "prog" or PG.pending then return end
+    local cur = PG.cur
+    if not (cur and (cur.aotc or cur.ce)) or not SetAchievementComparisonUnit then return end
+    if AchievementFrame and AchievementFrame:IsShown() then return end
+    local now = GetTime()
+    for _, m in ipairs(OverviewMembers()) do
+        local guid = UnitGUID(m.unit)
+        if usable(guid) and guid and not UnitIsUnit(m.unit, "player") and PG.ach[guid] == nil
+            and (not PG.tried[guid] or now - PG.tried[guid] > 30)
+            and UnitIsConnected(m.unit) and CanInspect(m.unit) then
+            PG.tried[guid] = now
+            PG.pending = guid
+            if not pcall(SetAchievementComparisonUnit, m.unit) then PG.pending = nil end
+            C_Timer.After(4, function()
+                if PG.pending == guid then
+                    PG.pending = nil
+                    if ClearAchievementComparisonUnit then pcall(ClearAchievementComparisonUnit) end
+                end
+            end)
+            return
+        end
+    end
+end
+
+function PG.AchReady(guid)
+    if not guid or guid ~= PG.pending then return end
+    PG.pending = nil
+    local state = {}
+    for _, a in ipairs(PG.AchList()) do
+        local ok, done = pcall(GetAchievementComparisonInfo, a.id)
+        state[a.id] = ok and done and true or false
+    end
+    PG.ach[guid] = state
+    if ClearAchievementComparisonUnit then pcall(ClearAchievementComparisonUnit) end
+end
+
+-- hover: boss by boss
+function PG.Tooltip(line)
+    local m, cur = line.prog, PG.cur
+    if not (m and cur) then return end
+    GameTooltip:SetOwner(line, "ANCHOR_RIGHT")
+    GameTooltip:SetText(m.name .. " - " .. cur.raid.name)
+    local names = PG.Bosses(cur.raid)
+    for i = 1, cur.raid.bossCount do
+        local parts = {}
+        for d = 1, 3 do
+            local per = m.diffs[d] and m.diffs[d].per
+            local k = per and per[i]
+            if type(k) == "number" and k > 0 then
+                parts[#parts + 1] = ("|cff%s%s %d|r"):format(DIFF_COLOR[d], DIFF_LETTER[d], k)
+            end
+        end
+        if #parts > 0 then
+            GameTooltip:AddDoubleLine(names[i], table.concat(parts, "  "), 1, 1, 1)
+        else
+            GameTooltip:AddDoubleLine(names[i], "-", 0.6, 0.6, 0.6, 0.6, 0.6, 0.6)
+        end
+    end
+    if not m.achKnown and (cur.aotc or cur.ce) then
+        GameTooltip:AddLine("Ahead of the Curve / Cutting Edge not read yet (needs to be in range).", 0.6, 0.6, 0.6, true)
+    end
+    GameTooltip:Show()
+end
+
+local OVERVIEW_W, OVERVIEW_LINE = 340, 18
 local OVERVIEW_MODES = {
     { key = "ilvl",  label = "Ilvl" },
     { key = "class", label = "Class" },
     { key = "tier",  label = "Tier Set" },
     { key = "buff",  label = "Raid Buff" },
+    { key = "prog",  label = "Progress" },
 }
 
 local function OverviewLine(i)
@@ -3564,6 +3904,8 @@ local function OverviewLine(i)
         local ok, err = pcall(InspectUnit, unit)
         if not ok then print("|cff33ff99BF:|r couldn't inspect:", err) end
     end)
+    l:SetScript("OnEnter", function(self) if self.prog then pcall(PG.Tooltip, self) end end)
+    l:SetScript("OnLeave", function() GameTooltip:Hide() end)
     l.sub = l:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     l.sub:SetJustifyH("LEFT")
     l.sub:SetTextColor(0.6, 0.6, 0.6)
@@ -3579,7 +3921,18 @@ local function RefreshOverview()
     end
 
     local members = OverviewMembers()
+    local progRaid, progData
+    if mode == "prog" then progRaid, progData = PG.Prepare(members) end
     local groups = BuildOverviewGroups(members, mode)
+
+    -- the raid picker only belongs to the Progress view
+    local top = (mode == "prog") and 102 or 74
+    overview.picker:SetShown(mode == "prog")
+    if mode ~= "prog" then overview.menu:Hide() end
+    overview.scroll:SetPoint("TOPLEFT", overview, "TOPLEFT", 12, -top)
+    if mode == "prog" then
+        overview.picker:SetState("off", progRaid and (progRaid.name .. "  v") or "No raid data  v")
+    end
 
     local n, y = 0, 0
     -- height: how tall this line is (default one line)
@@ -3599,7 +3952,7 @@ local function RefreshOverview()
         l.head:SetWordWrap(false)
         l.sub:Hide()
         l.head:SetFontObject("GameFontNormal")
-        l.unit, l.guid = nil, nil
+        l.unit, l.guid, l.prog = nil, nil, nil
         l.hl:SetShown(false)
         l.ilvl:ClearAllPoints()
         l.ilvl:SetPoint("RIGHT", -6, 0)
@@ -3666,7 +4019,13 @@ local function RefreshOverview()
             r.class:SetTextColor(0.65, 0.65, 0.65)
             r.class:SetText(m.spec or ClassName(m.class)); r.class:Show()
             r.ilvl:SetTextColor(1, 1, 1)
-            r.ilvl:SetText(m.ilvl and ("%d"):format(math.floor(m.ilvl + 0.5)) or "?")
+            if mode == "prog" then
+                r.prog = m
+                r.class:SetText(m.ptags ~= "" and m.ptags or (m.spec or ClassName(m.class)))
+                r.ilvl:SetText(m.psummary ~= "" and m.psummary or "")
+            else
+                r.ilvl:SetText(m.ilvl and ("%d"):format(math.floor(m.ilvl + 0.5)) or "?")
+            end
             r.ilvl:Show()
         end
     end
@@ -3696,6 +4055,16 @@ local function RefreshOverview()
         y = y - OVERVIEW_LINE + h
     end
 
+    if mode == "prog" and not progRaid then
+        local l = Next()
+        l.bg:SetColorTexture(0.9, 0.2, 0.2, 0.12)
+        l.role:Hide(); l.name:Hide(); l.class:Hide(); l.ilvl:Hide()
+        l.head:Show(); l.head:SetTextColor(1, 0.8, 0.8)
+        l.head:SetWidth(OVERVIEW_W - 12)
+        l.head:SetText(_G.RaiderIO and "Raider.IO has no raid progress for this group."
+            or "Raider.IO is not installed: it is where the raid progress comes from.")
+    end
+
     for i = n + 1, #overview.lines do overview.lines[i]:Hide() end
     if #members == 0 then
         local l = Next()
@@ -3707,9 +4076,11 @@ local function RefreshOverview()
     -- as tall as the content, up to what fits on screen below the window's top edge
     local maxH = math.max(300, (UIParent:GetHeight() or 900) - 140 - 84 - 40)
     overview.child:SetSize(OVERVIEW_W, math.max(y, 1))
-    overview:SetHeight(84 + math.min(y, maxH))
+    overview:SetHeight(top + 10 + math.min(y, maxH))
     overview.scroll:SetVerticalScroll(math.min(overview.scroll:GetVerticalScroll(), math.max(0, y - maxH)))
 end
+
+PG.refresh = RefreshOverview
 
 -- read the item level of one group member we do not know yet (one at a time)
 local function InspectNext()
@@ -3792,6 +4163,45 @@ local function CreateOverview()
         overview.modeButtons[#overview.modeButtons + 1] = b
     end
 
+    -- Progress view: which raid to compare
+    overview.picker = MakeToggleButton(overview, 12, -74, OVERVIEW_W)
+    overview.picker:SetState("off", "Raid")
+    overview.picker:Hide()
+    overview.menu = CreateFrame("Frame", nil, overview)
+    overview.menu:SetFrameStrata("FULLSCREEN_DIALOG")
+    overview.menu:SetPoint("TOPLEFT", overview.picker, "BOTTOMLEFT", 0, -2)
+    overview.menu:SetSize(OVERVIEW_W, 22)
+    overview.menu:Hide()
+    overview.menu.items = {}
+    local menuEdge = overview.menu:CreateTexture(nil, "BACKGROUND", nil, -2)
+    menuEdge:SetPoint("TOPLEFT", -1, 1)
+    menuEdge:SetPoint("BOTTOMRIGHT", 1, -1)
+    menuEdge:SetColorTexture(unpack(THEME.border))
+    local menuBg = overview.menu:CreateTexture(nil, "BACKGROUND", nil, -1)
+    menuBg:SetAllPoints()
+    menuBg:SetColorTexture(unpack(THEME.bg))
+    overview.picker:SetScript("OnClick", function()
+        local menu = overview.menu
+        if menu:IsShown() then menu:Hide() return end
+        for i, raid in ipairs(PG.raids) do
+            local b = menu.items[i]
+            if not b then
+                b = MakeToggleButton(menu, 0, -(i - 1) * 22, OVERVIEW_W)
+                menu.items[i] = b
+            end
+            b:SetState((PG.cur and PG.cur.raid.id == raid.id) and "sel" or "off", raid.name)
+            b:SetScript("OnClick", function()
+                db.overviewRaid = raid.id
+                menu:Hide()
+                RefreshOverview()
+            end)
+            b:Show()
+        end
+        for i = #PG.raids + 1, #menu.items do menu.items[i]:Hide() end
+        menu:SetHeight(math.max(22, #PG.raids * 22))
+        menu:Show()
+    end)
+
     overview.scroll = CreateFrame("ScrollFrame", nil, overview)
     overview.scroll:SetPoint("TOPLEFT", overview, "TOPLEFT", 12, -74)
     overview.scroll:SetPoint("BOTTOMRIGHT", overview, "BOTTOMRIGHT", -12, 10)
@@ -3821,12 +4231,16 @@ local function CreateOverview()
         if elapsed > 2.5 then
             elapsed = 0
             pcall(InspectNext)
+            pcall(PG.NextAch)
         end
     end)
     overview:RegisterEvent("GROUP_ROSTER_UPDATE")
     overview:RegisterEvent("INSPECT_READY")
+    overview:RegisterEvent("INSPECT_ACHIEVEMENT_READY")
     overview:SetScript("OnEvent", function(_, event, guid)
-        if event == "INSPECT_READY" then
+        if event == "INSPECT_ACHIEVEMENT_READY" then
+            pcall(PG.AchReady, guid)
+        elseif event == "INSPECT_READY" then
             if guid and guid == pendingInspect then
                 pendingInspect = nil
                 for _, m in ipairs(OverviewMembers()) do
@@ -4356,6 +4770,21 @@ SlashCmdList["BETTERFILTERS"] = function(msg)
     if (msg or ""):lower():match("^debug") then
         local ok, err = pcall(DebugDump)
         if not ok then print("|cff33ff99BF:|r debug error:", err) end
+    elseif (msg or ""):lower():match("^geo") then
+        local ok, err = pcall(DumpFrames, "geo")
+        if not ok then print("|cff33ff99BF:|r geo error:", err) end
+    elseif (msg or ""):lower():match("^frames") then
+        local ok, err = pcall(DumpFrames)
+        if not ok then print("|cff33ff99BF:|r frames error:", err) end
+    elseif (msg or ""):lower():match("^skin") then
+        db.reskin = not (db.reskin ~= false)
+        print("|cff33ff99BF:|r window skin " .. (db.reskin and "on" or "off") .. ". Type /reload to apply.")
+    elseif (msg or ""):lower():match("^bosses") then
+        local ok, err = pcall(_G.BetterFiltersDumpBosses, msg)
+        if not ok then print("|cff33ff99BF:|r bosses error:", err) end
+    elseif (msg or ""):lower():match("^prog") then
+        local ok, err = pcall(_G.BetterFiltersDumpProgress, msg)
+        if not ok then print("|cff33ff99BF:|r prog error:", err) end
     elseif (msg or ""):lower():match("^g") then
         local ok, err = pcall(ToggleOverview)
         if not ok then print("|cff33ff99BF:|r overview error:", err) end
@@ -4554,6 +4983,1020 @@ local function InstallTooltipFix()
     end
 end
 
+---------------------------------------------------------------------------
+-- Skin: restyle the Dungeons & Raids window and fit our panels inside it
+---------------------------------------------------------------------------
+-- Everything here is visual only. Each piece is applied on its own and guarded, so a
+-- name that does not exist in this game version is simply skipped.
+
+do
+local PANEL_W, EXTRA = 240, 240              -- our panels, and how much wider the window gets
+
+-- The window's own art is remembered as it is hidden, so Player vs. Player and Mythic+
+-- Dungeons (which are not ours to change) can have the game's window back.
+local WS = { stripped = {}, skinned = false, saved = {}, wasIn = nil }
+
+-- is the Dungeons & Raids tab the one showing?
+function WS.InDungeons()
+    local gf = _G.GroupFinderFrame
+    return (gf and gf:IsVisible()) and true or false
+end
+
+-- the game's own anchors of a frame we move, kept so the other tabs can have them back
+function WS.SaveNative(f)
+    if not f or f.BFNative or not f.GetNumPoints then return end
+    local pts = {}
+    for i = 1, f:GetNumPoints() do
+        local pt, rel, relPt, x, y = f:GetPoint(i)
+        pts[i] = { pt, rel, relPt, x, y }
+    end
+    f.BFNative = pts
+    WS.saved[#WS.saved + 1] = f
+end
+
+function WS.RestoreNative(f)
+    local pts = f.BFNative
+    if not pts or #pts == 0 then return end
+    f:ClearAllPoints()
+    for _, p in ipairs(pts) do
+        local rel = p[2]
+        -- the Premade Groups page of the PvP tab hangs on its own stub
+        if rel == _G.LFGListPVEStub and _G.LFGListPVPStub then rel = _G.LFGListPVPStub end
+        f:SetPoint(p[1], rel, p[3], p[4], p[5])
+    end
+end
+function WS.Log(o)
+    if WS.record and o and o.GetAlpha and o.BFOrigAlpha == nil then
+        o.BFOrigAlpha = o:GetAlpha()
+        o.BFOrigShown = o:IsShown()
+        WS.record[#WS.record + 1] = o
+    end
+end
+
+-- hide the art of a Blizzard frame without hiding the frame (its children stay)
+local function Strip(f)
+    if not f then return end
+    if f.GetRegions then
+        for _, r in ipairs({ f:GetRegions() }) do
+            if r.GetObjectType and r:GetObjectType() == "Texture" and not r.BFOwn then
+                WS.Log(r)
+                r:SetAlpha(0)
+                r:Hide()
+            end
+        end
+    end
+    for _, key in ipairs({ "NineSlice", "Bg", "BG", "Background", "Border", "TopTileStreaks", "shadows", "Shadows" }) do
+        local o = f[key]
+        if o and o.Hide then WS.Log(o); o:SetAlpha(0); o:Hide() end
+    end
+end
+
+-- a flat 1px-bordered box behind a frame
+local function FlatBox(f, bg, border, inset)
+    if f.BFBox then return f.BFBox end
+    inset = inset or 0
+    local e = f:CreateTexture(nil, "BACKGROUND", nil, -8)
+    e:SetPoint("TOPLEFT", f, "TOPLEFT", -1 + inset, 1 - inset)
+    e:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", 1 - inset, -1 + inset)
+    e.BFOwn = true
+    e:SetColorTexture(unpack(border or THEME.border))
+    local b = f:CreateTexture(nil, "BACKGROUND", nil, -7)
+    b.BFOwn = true
+    b:SetPoint("TOPLEFT", f, "TOPLEFT", inset, -inset)
+    b:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -inset, inset)
+    b:SetColorTexture(unpack(bg or THEME.bg))
+    f.BFBox = { edge = e, bg = b }
+    return f.BFBox
+end
+
+-- a Blizzard text button -> flat button
+local function SkinButton(btn)
+    if not btn or btn.BFSkinned then return end
+    btn.BFSkinned = true
+    Strip(btn)
+    for _, key in ipairs({ "Left", "Middle", "Right", "Center", "TopLeft", "TopRight", "BottomLeft", "BottomRight" }) do
+        local o = btn[key]
+        if o and o.SetAlpha then o:SetAlpha(0) end
+    end
+    for _, fn in ipairs({ "SetNormalTexture", "SetPushedTexture", "SetDisabledTexture", "SetHighlightTexture" }) do
+        if btn[fn] then pcall(btn[fn], btn, "") end
+    end
+    FlatBox(btn, TOGGLE_COLORS.off.bg, TOGGLE_COLORS.off.border)
+    local hover = btn:CreateTexture(nil, "HIGHLIGHT")
+    hover.BFOwn = true
+    hover:SetAllPoints()
+    hover:SetColorTexture(1, 0.82, 0, 0.10)
+end
+
+local function SkinTab(tab, selected)
+    if not tab then return end
+    Strip(tab)
+    for _, key in ipairs({ "Left", "Middle", "Right", "LeftActive", "MiddleActive", "RightActive", "LeftDisabled", "MiddleDisabled", "RightDisabled", "Center" }) do
+        local o = tab[key]
+        if o and o.SetAlpha then o:SetAlpha(0); o:Hide() end
+    end
+    local c = selected and TOGGLE_COLORS.sel or TOGGLE_COLORS.off
+    local box = FlatBox(tab, c.bg, c.border, 2)
+    box.bg:SetColorTexture(unpack(c.bg))
+    box.edge:SetColorTexture(unpack(c.border))
+    if not tab.BFHover then
+        tab.BFHover = tab:CreateTexture(nil, "HIGHLIGHT")
+        tab.BFHover.BFOwn = true
+        tab.BFHover:SetPoint("TOPLEFT", 2, -2)
+        tab.BFHover:SetPoint("BOTTOMRIGHT", -2, 2)
+        tab.BFHover:SetColorTexture(1, 0.82, 0, 0.10)
+    end
+end
+
+local function SkinTabs()
+    for i = 1, 8 do
+        local tab = _G["PVEFrameTab" .. i]
+        if tab then
+            -- the selected tab is the one the game has disabled
+            local selected = tab.IsEnabled and not tab:IsEnabled()
+            SkinTab(tab, selected)
+        end
+    end
+end
+
+-- The window's background: a frame behind everything else in the window. It also covers
+-- the Dungeon Finder / Raid Finder / Premade Groups column, which sticks out to the left
+-- of the window's own edge.
+local function SkinWindowBackground()
+    if not PVEFrame then return end
+    local bg = PVEFrame.BFWindowBG
+    if not bg then
+        bg = CreateFrame("Frame", nil, PVEFrame)
+        bg:SetFrameLevel(PVEFrame:GetFrameLevel())
+        PVEFrame.BFWindowBG = bg
+        FlatBox(bg, THEME.bg, THEME.border)
+    end
+    local out = 0
+    local first = GroupFinderFrame and GroupFinderFrame.groupButton1
+    local winLeft, btnLeft = PVEFrame:GetLeft(), first and first:GetLeft()
+    if winLeft and btnLeft and btnLeft < winLeft then out = winLeft - btnLeft + 6 end
+    bg:ClearAllPoints()
+    bg:SetPoint("TOPLEFT", PVEFrame, "TOPLEFT", -out, 0)
+    bg:SetPoint("BOTTOMRIGHT", PVEFrame, "BOTTOMRIGHT", 0, 0)
+end
+
+function WS.Core()
+    if not PVEFrame then return end
+    Strip(PVEFrame)
+    for _, name in ipairs({ "PVEFrameBlueBG", "PVEFrameLeftInset", "PVEFrameBg", "PVEFrameTitleBg",
+        "PVEFrameBottomBg", "PVEFrameTopBorder", "PVEFramePortrait", "PVEFrameShadows" }) do
+        Strip(_G[name])
+        local o = _G[name]
+        WS.Log(o)
+        if o and o.SetAlpha then o:SetAlpha(0) end
+    end
+    for _, key in ipairs({ "Inset", "PortraitContainer", "LeftInset" }) do Strip(PVEFrame[key]) end
+    if PVEFrame.PortraitContainer then WS.Log(PVEFrame.PortraitContainer); PVEFrame.PortraitContainer:SetAlpha(0) end
+    WS.record = nil
+
+    -- (the background itself is a frame of its own: see SkinWindowBackground)
+
+    -- title in the addon's gold
+    local title = PVEFrame.TitleContainer and PVEFrame.TitleContainer.TitleText
+    if title and title.SetTextColor then
+        if not title.BFOrigColor then title.BFOrigColor = { title:GetTextColor() } end
+        title:SetTextColor(unpack(THEME.gold))
+    end
+
+    -- close button -> a small flat "x"
+    local close = PVEFrame.CloseButton or _G.PVEFrameCloseButton
+    if close and not close.BFSkinned then
+        close.BFSkinned = true
+        -- the button keeps working but is invisible; a small "x" of ours is drawn over it
+        close:SetAlpha(0)
+        local xf = CreateFrame("Frame", nil, PVEFrame)
+        xf:SetAllPoints(close)
+        xf:SetFrameLevel((LFGListFrame and LFGListFrame:GetFrameLevel() or 1) + 60)
+        xf.text = xf:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        xf.text:SetPoint("CENTER", 0, 1)
+        xf.text:SetText("x")
+        close.BFX = xf
+    end
+
+    -- keep the close button on top of our panel, which now sits under the window's corner
+    local closeBtn = PVEFrame.CloseButton or _G.PVEFrameCloseButton
+    if closeBtn and closeBtn.SetFrameLevel and LFGListFrame then
+        pcall(closeBtn.SetFrameLevel, closeBtn, LFGListFrame:GetFrameLevel() + 50)
+    end
+
+    SkinWindowBackground()
+    SkinTabs()
+    WS.skinned = true
+end
+
+local function SkinWindow()
+    WS.record = WS.stripped
+    local ok, err = pcall(WS.Core)
+    WS.record = nil
+    if not ok then error(err, 0) end
+end
+
+-- Dungeons & Raids gets our look; the other tabs get the game's own window back
+function WS.Set(on)
+    if not PVEFrame or #WS.stripped == 0 then return end
+    for _, o in ipairs(WS.stripped) do
+        if on then
+            o:SetAlpha(0)
+            if o.GetObjectType and o:GetObjectType() == "Texture" then o:Hide() end
+        else
+            o:SetAlpha(o.BFOrigAlpha or 1)
+            if o.BFOrigShown then o:Show() end
+        end
+    end
+    if PVEFrame.BFWindowBG then PVEFrame.BFWindowBG:SetShown(on) end
+    if _G.LFGListFrame and LFGListFrame.BFBack then LFGListFrame.BFBack:SetShown(on) end
+    local close = PVEFrame.CloseButton or _G.PVEFrameCloseButton
+    if close then
+        close:SetAlpha(on and 0 or 1)
+        if close.BFX then close.BFX:SetShown(on) end
+    end
+    local title = PVEFrame.TitleContainer and PVEFrame.TitleContainer.TitleText
+    if title and title.BFOrigColor and not on then title:SetTextColor(unpack(title.BFOrigColor)) end
+    if title and on then title:SetTextColor(unpack(THEME.gold)) end
+    WS.skinned = on
+end
+
+-- the Premade Groups pages
+function WS.PremadeCore()
+    local f = LFGListFrame
+    if not f then return end
+    Strip(f)
+    local back = f.BFBack
+    if not back then
+        back = CreateFrame("Frame", nil, f)
+        back:SetAllPoints(f)
+        back:SetFrameLevel(math.max(0, f:GetFrameLevel() - 1))
+        f.BFBack = back
+        FlatBox(back, { 0.062, 0.054, 0.047, 1 }, THEME.border)
+    end
+
+    for _, pageKey in ipairs({ "CategorySelection", "SearchPanel", "EntryCreation", "ApplicationViewer" }) do
+        local page = f[pageKey]
+        if page then
+            Strip(page)
+            for _, key in ipairs({ "Inset", "ResultsInset", "InfoBackground", "NineSlice" }) do Strip(page[key]) end
+        end
+    end
+
+    -- text buttons
+    local cs, sp, ec, av = f.CategorySelection, f.SearchPanel, f.EntryCreation, f.ApplicationViewer
+    for _, b in ipairs({
+        cs and cs.FindGroupButton, cs and cs.StartGroupButton,
+        sp and sp.BackButton, sp and sp.BackToGroupButton, sp and sp.SignUpButton,
+        ec and ec.ListGroupButton, ec and ec.CancelButton,
+        av and av.BrowseGroupsButton, av and av.RemoveEntryButton, av and av.EditButton,
+    }) do
+        pcall(SkinButton, b)
+    end
+
+    -- search box
+    if sp and sp.SearchBox and not sp.SearchBox.BFSkinned then
+        sp.SearchBox.BFSkinned = true
+        pcall(SkinEditBox, sp.SearchBox)
+    end
+end
+
+local function SkinPremade()
+    -- the Premade Groups page of the Player vs. Player tab is not ours to change
+    if not WS.InDungeons() then return end
+    WS.record = WS.stripped
+    local ok, err = pcall(WS.PremadeCore)
+    WS.record = nil
+    if not ok then error(err, 0) end
+end
+
+-- The Dungeon Finder / Raid Finder / Premade Groups buttons: the game's own buttons are
+-- laid out by the game (it puts them straight back when moved), so they are hidden and
+-- three flat buttons of ours take their place in the title bar. Clicking one presses the
+-- game's button.
+local GROUP_BTN_W, GROUP_BTN_H = 102, 40
+local groupTabs = {}
+local GROUP_EDGE = 6      -- the buttons' distance from the window's left and top edges
+
+local groupOrig = {}
+local ReflowPages, PagesMoved, FitWindow, LayoutTabs, NarrowPage
+
+local function UpdateGroupTabs()
+    local gf = GroupFinderFrame
+    -- our title-bar buttons belong to the Dungeons & Raids tab only
+    local inTab = (gf and gf:IsVisible()) and true or false
+    for _, tab in ipairs(groupTabs) do tab:SetShown(inTab) end
+    if WS.skinned ~= inTab then pcall(WS.Set, inTab) end
+    if WS.wasIn ~= inTab then
+        WS.wasIn = inTab
+        if not inTab then
+            for _, f in ipairs(WS.saved) do pcall(WS.RestoreNative, f) end
+        end
+    end
+    local title = PVEFrame and PVEFrame.TitleContainer and PVEFrame.TitleContainer.TitleText
+    if title then title:SetAlpha(inTab and 0 or 1) end
+    local selected
+    -- the game moves its selection marker onto the chosen button
+    if gf and gf.selection and gf.selection.GetPoint then
+        local ok, _, rel = pcall(gf.selection.GetPoint, gf.selection, 1)
+        if ok and rel then
+            for i, o in ipairs(groupOrig) do
+                if o == rel then selected = i end
+            end
+        end
+    end
+    if not selected then
+        if _G.LFDParentFrame and LFDParentFrame:IsVisible() then selected = 1 end
+        if _G.RaidFinderFrame and RaidFinderFrame:IsVisible() then selected = 2 end
+        if _G.LFGListFrame and LFGListFrame:IsVisible() then selected = 3 end
+    end
+    for i, tab in ipairs(groupTabs) do
+        if tab.refresh and not (tab.iconDone and tab.ringDone) then tab.refresh() end
+        local c = (i == selected) and TOGGLE_COLORS.sel or TOGGLE_COLORS.off
+        tab.edge:SetColorTexture(unpack(c.border))
+        tab.bg:SetColorTexture(unpack(c.bg))
+    end
+end
+
+-- text and the round icon / ring of one of the game's group buttons, wherever it keeps them
+local function ButtonParts(orig)
+    local name, icon, ring
+    local gname = orig.GetName and orig:GetName()
+    name = orig.name or orig.Name or orig.Text or (gname and _G[gname .. "Name"])
+    icon = orig.icon or orig.Icon or (gname and _G[gname .. "Icon"])
+    ring = orig.ring or orig.Ring or (gname and _G[gname .. "Ring"])
+    if not (name and name.GetText) then
+        name = nil
+        for _, r in ipairs({ orig:GetRegions() }) do
+            if r.GetObjectType and r:GetObjectType() == "FontString" and (r:GetText() or "") ~= "" then name = r break end
+        end
+    end
+    if not (icon and icon.GetTexture) then
+        icon, ring = nil, nil
+        local textures = {}
+        for _, r in ipairs({ orig:GetRegions() }) do
+            if r.GetObjectType and r:GetObjectType() == "Texture" and (r:GetAtlas() or r:GetTexture()) then
+                textures[#textures + 1] = r
+            end
+        end
+        -- the icon is the one drawn smallest of the textures that are not backgrounds
+        table.sort(textures, function(a, b) return (a:GetWidth() or 0) < (b:GetWidth() or 0) end)
+        icon = textures[1]
+        ring = textures[2]
+    end
+    return name, icon, ring
+end
+
+local GROUP_NAMES = {
+    _G.LOOKING_FOR_DUNGEON or "Dungeon Finder",
+    _G.RAID_FINDER or "Raid Finder",
+    _G.LFGLIST_NAME or "Premade Groups",
+}
+
+local function BuildGroupTabs()
+    local gf = GroupFinderFrame
+    if not (gf and PVEFrame) or #groupTabs > 0 then return end
+
+    local n = 0
+    for i = 1, 3 do
+        local orig = gf["groupButton" .. i]
+        if orig then
+            n = n + 1
+            local tab = CreateFrame("Button", nil, PVEFrame)
+            tab:SetSize(GROUP_BTN_W, GROUP_BTN_H)
+            tab:SetPoint("TOPLEFT", PVEFrame, "TOPLEFT", GROUP_EDGE + (n - 1) * (GROUP_BTN_W + 3), -GROUP_EDGE)
+            tab:SetFrameLevel(PVEFrame:GetFrameLevel() + 30)
+
+            tab.edge = tab:CreateTexture(nil, "BACKGROUND", nil, -8)
+            tab.edge:SetAllPoints()
+            tab.bg = tab:CreateTexture(nil, "BACKGROUND", nil, -7)
+            tab.bg:SetPoint("TOPLEFT", 1, -1)
+            tab.bg:SetPoint("BOTTOMRIGHT", -1, 1)
+            local hover = tab:CreateTexture(nil, "HIGHLIGHT")
+            hover:SetAllPoints()
+            hover:SetColorTexture(1, 0.82, 0, 0.10)
+
+            -- the same round icon as the game's button, smaller
+            tab.icon = tab:CreateTexture(nil, "ARTWORK")
+            tab.icon:SetSize(22, 22)
+            tab.icon:SetPoint("LEFT", 5, 0)
+            tab.ring = tab:CreateTexture(nil, "OVERLAY")
+            tab.ring:SetSize(30, 30)
+            tab.ring:SetPoint("CENTER", tab.icon, "CENTER", 0, 0)
+            local function Copy(from, to)
+                if not (from and to) then return end
+                local atlas = from.GetAtlas and from:GetAtlas()
+                if atlas then
+                    to:SetAtlas(atlas)
+                else
+                    to:SetTexture(from:GetTexture())
+                    to:SetTexCoord(from:GetTexCoord())
+                end
+            end
+            local nameFS, iconTex, ringTex = ButtonParts(orig)
+            -- the game sets the icons after it builds the buttons: copy again until they exist
+            tab.refresh = function()
+                if iconTex and not tab.iconDone then
+                    local has = (iconTex.GetAtlas and iconTex:GetAtlas()) or iconTex:GetTexture()
+                    if has then
+                        pcall(Copy, iconTex, tab.icon)
+                        tab.iconDone = true
+                    end
+                end
+                if ringTex and not tab.ringDone then
+                    local has = (ringTex.GetAtlas and ringTex:GetAtlas()) or ringTex:GetTexture()
+                    if has then
+                        pcall(Copy, ringTex, tab.ring)
+                        tab.ringDone = true
+                    end
+                end
+            end
+            tab.refresh()
+            groupOrig[n] = orig
+
+            tab.text = tab:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+            tab.text:SetPoint("LEFT", 38, 0)
+            tab.text:SetWidth(GROUP_BTN_W - 42)
+            tab.text:SetJustifyH("LEFT")
+            tab.text:SetJustifyV("MIDDLE")
+            tab.text:SetWordWrap(true)
+            tab.text:SetMaxLines(2)
+            local label = nameFS and nameFS:GetText()
+            if not label or label == "" then label = GROUP_NAMES[i] end
+            tab.text:SetText(label)
+
+            tab:SetScript("OnClick", function()
+                orig:Click()
+                C_Timer.After(0, UpdateGroupTabs)
+            end)
+            groupTabs[n] = tab
+
+            -- the game's button stays, invisible and out of the way
+            orig:SetAlpha(0)
+            orig:EnableMouse(false)
+        end
+    end
+    if gf.selection then gf.selection:SetAlpha(0) end
+    -- keep the highlight and the page layout right whatever the game does
+    local acc = 0
+    PVEFrame:HookScript("OnUpdate", function(_, elapsed)
+        acc = acc + elapsed
+        if acc < 0.15 then return end
+        acc = 0
+        UpdateGroupTabs()
+        if FitWindow then pcall(FitWindow) end
+        if LayoutTabs then pcall(LayoutTabs) end
+        if PagesMoved and PagesMoved() then pcall(ReflowPages) end
+    end)
+    local title = PVEFrame.TitleContainer and PVEFrame.TitleContainer.TitleText
+    if title then title:SetAlpha(0) end
+
+    for _, page in ipairs({ _G.LFDParentFrame, _G.RaidFinderFrame, _G.LFGListPVEStub, _G.LFGListFrame }) do
+        if page and page.HookScript then
+            page:HookScript("OnShow", function() C_Timer.After(0, UpdateGroupTabs) end)
+        end
+    end
+    if _G.GroupFinderFrame_SelectGroupButton then
+        hooksecurefunc("GroupFinderFrame_SelectGroupButton", function() C_Timer.After(0, UpdateGroupTabs) end)
+    end
+    UpdateGroupTabs()
+end
+
+local function SkinGroupButtons()
+    BuildGroupTabs()
+    UpdateGroupTabs()
+end
+
+-- The pages take the room the left column used to have. The game anchors them to its own
+-- frames (and sets those anchors again now and then), so each page is anchored to the
+-- window itself and put back whenever the game moves it.
+local extendedNow = false          -- is our panel making the window wider? (see FitWindow)
+local pageAnchoring = false
+
+local SEARCH_LIFT, BOTTOM_PAD = 30, 8
+local SEARCH_PAD = 6     -- Back / Sign Up: the same distance from the left, right and bottom edges
+
+-- The Dungeon Finder anchors its role buttons and its Type dropdown to the BOTTOM of its
+-- page, so moving the page's top never moved them. They are placed here, 10 lower.
+local LFD_LOWER = 10
+local function LFDPieces()
+    local q = _G.LFDQueueFrame
+    if not q then return {} end
+    return {
+        { _G.LFDQueueFrameRoleButtonTank, 50, 334 - LFD_LOWER, q },
+        { _G.LFDQueueFrameTypeDropdown, 131, 287 - LFD_LOWER, q },
+    }
+end
+
+local function SearchButtons()
+    local sp = _G.LFGListFrame and LFGListFrame.SearchPanel
+    if not sp then return {} end
+    return {
+        { sp.BackButton, "BOTTOMLEFT", SEARCH_PAD, sp },
+        { sp.SignUpButton, "BOTTOMRIGHT", -SEARCH_PAD, sp },
+    }
+end
+local CATEGORY_LIFT = 34       -- the category list sits higher: it has its own space at the top
+
+local function PageSpecs()
+    local specs = {}
+    local list = _G.LFGListFrame
+    if list then
+        specs[#specs + 1] = { list, 2, 8, -(8 + (extendedNow and EXTRA or 0)), -(GROUP_BTN_H + 6), PVEFrame }
+        if list.CategorySelection then
+            specs[#specs + 1] = { list.CategorySelection, 2, 0, 0, CATEGORY_LIFT, list }
+        end
+        -- the group list and the applicants: a little higher, and off the bottom edge
+        if list.SearchPanel then
+            specs[#specs + 1] = { list.SearchPanel, 2, 0, 0, SEARCH_LIFT, list, 0 }
+        end
+        if list.ApplicationViewer then
+            specs[#specs + 1] = { list.ApplicationViewer, 2, 0, 0, SEARCH_LIFT, list, BOTTOM_PAD }
+        end
+        if list.EntryCreation then
+            specs[#specs + 1] = { list.EntryCreation, 2, 0, 0, CATEGORY_LIFT, list }
+        end
+    end
+    -- Dungeon Finder / Raid Finder keep their own width: centred in the window
+    local cx = -(extendedNow and EXTRA / 2 or 0)
+    if _G.LFDParentFrame then specs[#specs + 1] = { LFDParentFrame, 1, cx, nil, -25, PVEFrame } end
+    -- the Raid Finder lays its top part out lower than the Dungeon Finder does
+    if _G.RaidFinderFrame then specs[#specs + 1] = { RaidFinderFrame, 1, cx, nil, -10, PVEFrame } end
+    return specs
+end
+
+local function Near(a, b) return math.abs((a or 0) - (b or 0)) < 0.5 end
+
+-- did the game move any of the pages since we placed them?
+function PagesMoved()
+    if not PVEFrame or not WS.InDungeons() then return false end
+    for _, sp in ipairs(PageSpecs()) do
+        local page, rel0 = sp[1], sp[6]
+        if page:GetNumPoints() ~= sp[2] then return true end
+        local _, rel, _, x, y = page:GetPoint(1)
+        if rel ~= rel0 or not Near(y, sp[5]) then return true end
+        if sp[2] == 2 then
+            local _, rel2, _, x2, y2 = page:GetPoint(2)
+            if rel2 ~= rel0 or not Near(x, sp[3]) or not Near(x2, sp[4]) or not Near(y2, sp[7] or 0) then return true end
+        elseif not Near(x, sp[3]) or not Near(page:GetHeight(), PVEFrame:GetHeight() + sp[5]) then
+            return true
+        end
+    end
+    for _, e in ipairs(LFDPieces()) do
+        local f = e[1]
+        if f then
+            local _, rel, _, x, y = f:GetPoint(1)
+            if rel ~= e[4] or not Near(x, e[2]) or not Near(y, e[3]) then return true end
+        end
+    end
+    for _, e in ipairs(SearchButtons()) do
+        local b = e[1]
+        if b then
+            local _, rel, _, x, y = b:GetPoint(1)
+            if b:GetNumPoints() ~= 1 or rel ~= e[4] or not Near(x, e[3]) or not Near(y, SEARCH_PAD) then return true end
+        end
+    end
+    return false
+end
+
+function ReflowPages()
+    if pageAnchoring or not PVEFrame or not WS.InDungeons() then return end
+    pageAnchoring = true
+    local ok, err = pcall(function()
+        for _, sp in ipairs(PageSpecs()) do
+            local page, rel = sp[1], sp[6]
+            WS.SaveNative(page)
+            page:ClearAllPoints()
+            if sp[2] == 2 then
+                page:SetPoint("TOPLEFT", rel, "TOPLEFT", sp[3], sp[5])
+                page:SetPoint("BOTTOMRIGHT", rel, "BOTTOMRIGHT", sp[4], sp[7] or 0)
+            else
+                page:SetPoint("TOP", rel, "TOP", sp[3], sp[5])
+                -- ends at the bottom of the window, so the Find Group button sits at the
+                -- same distance from the bottom as on the Premade Groups pages
+                page:SetHeight(math.max(100, PVEFrame:GetHeight() + sp[5]))
+            end
+        end
+        for _, e in ipairs(LFDPieces()) do
+            if e[1] then
+                WS.SaveNative(e[1])
+                e[1]:ClearAllPoints()
+                e[1]:SetPoint("BOTTOMLEFT", e[4], "BOTTOMLEFT", e[2], e[3])
+            end
+        end
+        for _, e in ipairs(SearchButtons()) do
+            if e[1] then
+                WS.SaveNative(e[1])
+                e[1]:ClearAllPoints()
+                e[1]:SetPoint(e[2], e[4], e[2], e[3], SEARCH_PAD)
+            end
+        end
+    end)
+    pageAnchoring = false
+    if not ok then print("|cff33ff99BF:|r page layout:", err) end
+    pcall(LayoutTabs)
+end
+
+-- The tabs under the window (Dungeons & Raids / Player vs. Player / Mythic+ Dungeons):
+-- sized to fit the window and centred under it, clear of our panel on the right.
+local tabsAnchoring, tabsBaseY = false, nil
+
+function LayoutTabs()
+    if tabsAnchoring or not PVEFrame then return end
+    -- the three buttons in the title bar: fixed size on the narrow pages, filling the
+    -- window's width on the wide ones
+    local gt = #groupTabs
+    if gt > 0 then
+        local baseW = (PVEFrame:GetWidth() or 0) - (extendedNow and EXTRA or 0)
+        local gw = NarrowPage() and GROUP_BTN_W or math.floor((baseW - 2 * GROUP_EDGE - 3 * (gt - 1)) / gt)
+        if groupTabs[1].curW ~= gw then
+            for i, t in ipairs(groupTabs) do
+                t.curW = gw
+                t:SetWidth(gw)
+                t:ClearAllPoints()
+                t:SetPoint("TOPLEFT", PVEFrame, "TOPLEFT", GROUP_EDGE + (i - 1) * (gw + 3), -GROUP_EDGE)
+                t.text:SetWidth(gw - 42)
+            end
+        end
+    end
+    local tabs = {}
+    for i = 1, 8 do
+        local t = _G["PVEFrameTab" .. i]
+        if t and t:IsShown() then tabs[#tabs + 1] = t end
+    end
+    if #tabs == 0 then return end
+    if not tabsBaseY then
+        local pt, _, relPt, _, y = tabs[1]:GetPoint(1)
+        tabsBaseY = (pt == "TOPLEFT" and relPt == "BOTTOMLEFT" and y) or -2
+    end
+    local W = (PVEFrame:GetWidth() or 0) - (extendedNow and EXTRA or 0)
+    local gap = 3
+    local w = math.max(96, math.min(150, math.floor((W - 16 - gap * (#tabs - 1)) / #tabs)))
+    local x0 = math.floor((W - (w * #tabs + gap * (#tabs - 1))) / 2)
+    local fine = true
+    for i, t in ipairs(tabs) do
+        local _, rel, _, x = t:GetPoint(1)
+        if t:GetNumPoints() ~= 1 or rel ~= PVEFrame or not Near(x, x0 + (i - 1) * (w + gap)) or not Near(t:GetWidth(), w) then
+            fine = false
+        end
+    end
+    if fine then return end
+    tabsAnchoring = true
+    for i, t in ipairs(tabs) do
+        t:ClearAllPoints()
+        t:SetPoint("TOPLEFT", PVEFrame, "BOTTOMLEFT", x0 + (i - 1) * (w + gap), tabsBaseY)
+        t:SetWidth(w)
+    end
+    tabsAnchoring = false
+end
+
+local premadeHooked = false
+
+local function ReflowPremade()
+    ReflowPages()
+    if premadeHooked then return end
+    premadeHooked = true
+    local list = _G.LFGListFrame
+    local pages = { list and list.SearchPanel and list.SearchPanel.BackButton, list and list.SearchPanel and list.SearchPanel.SignUpButton, list, list and list.CategorySelection, list and list.EntryCreation, list and list.SearchPanel, list and list.ApplicationViewer, _G.LFDParentFrame, _G.RaidFinderFrame }
+    for _, page in pairs(pages) do
+        for _, fn in ipairs({ "SetPoint", "SetAllPoints", "ClearAllPoints" }) do
+            hooksecurefunc(page, fn, function()
+                if not pageAnchoring then C_Timer.After(0, function() pcall(ReflowPages) end) end
+            end)
+        end
+    end
+    -- put things right the moment a page shows or hides, not a moment later
+    local function Refit()
+        pcall(UpdateGroupTabs)
+        if FitWindow then pcall(FitWindow) end
+        pcall(ReflowPages)
+    end
+    local shown = { list, _G.LFDParentFrame, _G.RaidFinderFrame, _G.LFGListPVEStub, _G.GroupFinderFrame }
+    if list then
+        for _, k in ipairs({ "CategorySelection", "SearchPanel", "EntryCreation", "ApplicationViewer" }) do
+            shown[#shown + 1] = list[k]
+        end
+    end
+    for _, f in pairs(shown) do
+        if f.HookScript then
+            f:HookScript("OnShow", Refit)
+            f:HookScript("OnHide", Refit)
+        end
+    end
+end
+
+local nativeW, nativeH, lastFit
+local fitting = false
+local NARROW_W = 354
+
+local function AnyOurPanelShown()
+    for _, p in ipairs({ panel, raidPanel, appPanel, appRaidPanel }) do
+        if p and p:IsShown() then return true end
+    end
+    return false
+end
+
+-- the tallest of our panels that is showing
+local function PanelHeight()
+    local h = 0
+    for _, p in ipairs({ panel, raidPanel, appPanel, appRaidPanel }) do
+        if p and p:IsShown() then h = math.max(h, p:GetHeight() or 0) end
+    end
+    return h
+end
+
+-- The Premade Groups pages may or may not stretch with the window by themselves. Any
+-- that did not get the extra height here, so the list shows more groups.
+local function StretchPages(delta)
+    local list = LFGListFrame
+    if not list then return end
+    -- LFGListFrame is anchored to LFGListPVEStub, which has a fixed height of its own:
+    -- that is the one that has to grow (the pages are anchored to LFGListFrame)
+    local frames = { _G.LFGListPVEStub, list, list.CategorySelection, list.SearchPanel, list.EntryCreation, list.ApplicationViewer }
+    for _, f in ipairs(frames) do
+        if f and not f.BFBaseHeight then f.BFBaseHeight = f:GetHeight() end
+    end
+    C_Timer.After(0, function()
+        for _, f in ipairs(frames) do
+            local base = f and f.BFBaseHeight
+            if base and base > 0 then
+                if delta > 0 then
+                    if f:GetHeight() < base + delta - 1 then
+                        f:SetHeight(base + delta)
+                        f.BFStretched = true
+                    end
+                elseif f.BFStretched then
+                    f:SetHeight(base)
+                    f.BFStretched = nil
+                end
+            end
+        end
+    end)
+end
+
+-- make the window wide and tall enough for our panel while one is showing
+-- the pages that only hold a short column (the finders, the category list) get a narrow
+-- window; the group lists and forms get the full width
+function NarrowPage()
+    if _G.LFDParentFrame and LFDParentFrame:IsVisible() then return true end
+    if _G.RaidFinderFrame and RaidFinderFrame:IsVisible() then return true end
+    local l = _G.LFGListFrame
+    if l and l:IsVisible() and l.CategorySelection and l.CategorySelection:IsShown() then return true end
+    if l and l:IsVisible() and l.EntryCreation and l.EntryCreation:IsShown() then return true end
+    if l and l:IsVisible() and l.ApplicationViewer and l.ApplicationViewer:IsShown() then return true end
+    return false
+end
+
+function FitWindow()
+    if not PVEFrame or fitting then return end
+    -- Player vs. Player and Mythic+ Dungeons size the window themselves: hands off
+    local inTab = WS.InDungeons()
+    if not inTab then
+        lastFit = nil
+        extendedNow = false
+        -- the game does not always resize the window when the tab changes: whatever size
+        -- of ours is still on it goes back to the normal one
+        if nativeW and WS.ourW and WS.ourH then
+            fitting = true
+            if Near(PVEFrame:GetHeight(), WS.ourH) then PVEFrame:SetHeight(nativeH) end
+            if Near(PVEFrame:GetWidth(), WS.ourW) then PVEFrame:SetWidth(nativeW) end
+            fitting = false
+            WS.ourW, WS.ourH = nil, nil
+        end
+        return
+    end
+    if not nativeW then nativeW, nativeH = PVEFrame:GetWidth(), PVEFrame:GetHeight() end
+    local w = NarrowPage() and NARROW_W or nativeW
+    local h = nativeH
+    local panelShown = inTab and AnyOurPanelShown()
+    if panelShown then
+        w = w + EXTRA
+        h = math.max(nativeH, PanelHeight())
+    end
+    local key = w .. "x" .. h
+    if key == lastFit and Near(PVEFrame:GetWidth(), w) and Near(PVEFrame:GetHeight(), h) then return end
+    lastFit = key
+    extendedNow = panelShown
+    fitting = true
+    PVEFrame:SetSize(w, h)
+    fitting = false
+    WS.ourW, WS.ourH = w, h
+    pcall(ReflowPremade)
+    StretchPages(h - nativeH)
+end
+
+-- our panel becomes the right-hand column of the window, flush with its top and edge
+local function DockPanel(p)
+    if not (p and PVEFrame) then return end
+    p:ClearAllPoints()
+    p:SetPoint("TOPRIGHT", PVEFrame, "TOPRIGHT", 0, 0)
+    p:HookScript("OnShow", function() pcall(FitWindow) end)
+    p:HookScript("OnHide", function() C_Timer.After(0, function() pcall(FitWindow) end) end)
+    -- some panels change height (the note box folding away): follow it
+    hooksecurefunc(p, "SetHeight", function() if p:IsShown() then pcall(FitWindow) end end)
+    if p:IsShown() then pcall(FitWindow) end
+end
+
+function InstallSkin()
+    if db.reskin == false then return end
+    local steps = {
+        { "window", SkinWindow },
+        { "premade pages", SkinPremade },
+        { "group buttons", SkinGroupButtons },
+        { "premade room", ReflowPremade },
+        { "dock panels", function()
+            for _, p in ipairs({ panel, raidPanel, appPanel, appRaidPanel }) do DockPanel(p) end
+        end },
+    }
+    for _, step in ipairs(steps) do
+        local ok, err = pcall(step[2])
+        if not ok then print("|cff33ff99BF:|r skin step '" .. step[1] .. "' failed:", err) end
+    end
+
+    -- the game restyles tabs when they change; restyle them again straight after
+    if PanelTemplates_SelectTab then
+        hooksecurefunc("PanelTemplates_SelectTab", function(tab)
+            if tab and tab.GetParent and tab:GetParent() == PVEFrame then pcall(SkinTab, tab, true) end
+        end)
+    end
+    if PanelTemplates_DeselectTab then
+        hooksecurefunc("PanelTemplates_DeselectTab", function(tab)
+            if tab and tab.GetParent and tab:GetParent() == PVEFrame then pcall(SkinTab, tab, false) end
+        end)
+    end
+    -- the game lays the bottom tabs out again every time the window opens: put them back
+    -- the instant it does, so they never show in the game's places
+    for i = 1, 8 do
+        local tab = _G["PVEFrameTab" .. i]
+        if tab then
+            for _, fn in ipairs({ "SetPoint", "SetWidth", "Show" }) do
+                hooksecurefunc(tab, fn, function()
+                    if not tabsAnchoring then pcall(LayoutTabs) end
+                end)
+            end
+        end
+    end
+    -- pages can be built the first time they are opened: run again when the window shows
+    -- the window must be the right size the moment it opens, not a few frames later: fit
+    -- it straight away, and again whenever the game sets its size
+    local function Resync()
+        lastFit = nil
+        pcall(FitWindow)
+        pcall(ReflowPages)
+        pcall(LayoutTabs)
+        pcall(UpdateGroupTabs)
+    end
+    for _, fn in ipairs({ "SetSize", "SetWidth", "SetHeight" }) do
+        hooksecurefunc(PVEFrame, fn, function()
+            if not fitting then
+                lastFit = nil
+                pcall(FitWindow)
+            end
+        end)
+    end
+    PVEFrame:HookScript("OnShow", function()
+        pcall(SkinWindow)
+        pcall(SkinPremade)
+        pcall(SkinGroupButtons)
+        pcall(ReflowPremade)
+        Resync()
+        -- the left column is only laid out once the window is up: measure again
+        C_Timer.After(0, function() pcall(SkinWindowBackground) end)
+    end)
+    LFGListFrame:HookScript("OnShow", function()
+        C_Timer.After(0, function() pcall(SkinPremade) end)
+    end)
+end
+
+-- /bf geo : sizes and anchors of the Premade Groups pieces (for fixing the layout)
+local function DumpGeo()
+    local function Say(...) print("|cff33ff99BF geo:|r", ...) end
+    local function Show(label, f)
+        if not f then Say(label, "not found") return end
+        Say(label, ("size %.0f x %.0f"):format(f:GetWidth() or 0, f:GetHeight() or 0), "points:", f:GetNumPoints())
+        for i = 1, f:GetNumPoints() do
+            local point, rel, relPoint, x, y = f:GetPoint(i)
+            local relName = rel and (rel.GetName and rel:GetName()) or tostring(rel)
+            Say("   ", point, "->", tostring(relName), relPoint, ("%.0f"):format(x or 0), ("%.0f"):format(y or 0))
+        end
+    end
+    -- what is inside the Dungeon Finder / Raid Finder pages and where it really is
+    local function Walk(f, depth)
+        -- texts and pictures the frame keeps under a key (Name, ItemLevel, ...)
+        for k, v in pairs(f) do
+            if type(k) == "string" and type(v) == "table" and v.GetObjectType and v.GetPoint and not v.GetChildren then
+                local ok, ot = pcall(v.GetObjectType, v)
+                if ok and (ot == "FontString" or ot == "Texture") and v.GetNumPoints and v:GetNumPoints() > 0 then
+                    local pt, rel, relPt, x, y = v:GetPoint(1)
+                    local relName = rel and (rel.GetName and rel:GetName()) or tostring(rel)
+                    local top = v.GetTop and v:GetTop()
+                    local txt = ""
+                    if ot == "FontString" then local okT, t = pcall(v.GetText, v); txt = okT and tostring(t) or "" end
+                    Say(("  "):rep(depth), "." .. k, ot,
+                        top and ("top %.0f"):format(PVEFrame:GetTop() - top) or "no top",
+                        ("size %.0f x %.0f"):format(v:GetWidth() or 0, v:GetHeight() or 0),
+                        tostring(pt), "->", tostring(relName), tostring(relPt), ("%.0f"):format(x or 0), ("%.0f"):format(y or 0), txt)
+                end
+            end
+        end
+        for _, child in ipairs({ f:GetChildren() }) do
+            local top = child.GetTop and child:GetTop()
+            local pt, rel, relPt, x, y = child:GetPoint(1)
+            local relName = rel and (rel.GetName and rel:GetName()) or tostring(rel)
+            local par = child:GetParent()
+            Say(("  "):rep(depth), child:GetName() or ("<" .. child:GetObjectType() .. ">"),
+                top and ("top %.0f"):format(PVEFrame:GetTop() - top) or "no top",
+                ("size %.0f x %.0f"):format(child:GetWidth() or 0, child:GetHeight() or 0),
+                tostring(pt), "->", tostring(relName), tostring(relPt), ("%.0f"):format(x or 0), ("%.0f"):format(y or 0),
+                "parent", tostring(par and par.GetName and par:GetName()))
+            if depth < 3 then Walk(child, depth + 1) end
+        end
+    end
+    local viewer = _G.LFGListFrame and LFGListFrame.ApplicationViewer
+    if viewer and viewer:IsVisible() and PVEFrame then
+        Say("ApplicationViewer contents:")
+        local seen = 0
+        Walk(viewer, 1)
+        local box = viewer.ScrollBox
+        if box and box.ForEachFrame then
+            box:ForEachFrame(function(row)
+                seen = seen + 1
+                if seen == 1 then
+                    Say("first applicant row:", row:GetName() or "<row>", ("size %.0f x %.0f"):format(row:GetWidth() or 0, row:GetHeight() or 0))
+                    Walk(row, 1)
+                end
+            end)
+        end
+    end
+    local queue = _G.LFDParentFrame and _G.LFDParentFrame:IsVisible() and _G.LFDQueueFrame
+    if queue and PVEFrame then
+        Say("LFDQueueFrame contents:")
+        Walk(queue, 1)
+    end
+    for _, name in ipairs({ "LFDQueueFrameRoleButtonTank", "LFDQueueFrameRoleButtonHealer", "LFDQueueFrameRoleButtonDPS", "LFDQueueFrameRoleButtonLeader", "LFDQueueFrameTypeDropdown", "LFDQueueFrameTypeDropDown" }) do
+        local f = _G[name]
+        if f and PVEFrame and f:IsVisible() then
+            local pt, rel, relPt, x, y = f:GetPoint(1)
+            local par = f:GetParent()
+            Say(name, ("top %.0f"):format(PVEFrame:GetTop() - (f:GetTop() or 0)), tostring(pt), "->",
+                tostring(rel and rel.GetName and rel:GetName()), tostring(relPt), ("%.0f"):format(x or 0), ("%.0f"):format(y or 0),
+                "parent", tostring(par and par.GetName and par:GetName()))
+        end
+    end
+    local list = LFGListFrame
+    Show("GroupFinderFrame", GroupFinderFrame)
+    Show("LFGListPVEStub", _G.LFGListPVEStub)
+    Show("LFDParentFrame", _G.LFDParentFrame)
+    Show("RaidFinderFrame", _G.RaidFinderFrame)
+    Show("groupButton1", GroupFinderFrame and GroupFinderFrame.groupButton1)
+    Show("PVEFrame", PVEFrame)
+    Show("LFGListFrame", list)
+    if list then
+        local sp = list.SearchPanel
+        Show("SearchPanel", sp)
+        if sp then
+            Show("ScrollBox", sp.ScrollBox)
+            Show("ResultsInset", sp.ResultsInset)
+            Show("BackButton", sp.BackButton)
+            Show("SignUpButton", sp.SignUpButton)
+        end
+        Show("CategorySelection", list.CategorySelection)
+        Show("EntryCreation", list.EntryCreation)
+        Show("ApplicationViewer", list.ApplicationViewer)
+    end
+end
+
+-- /bf frames : names of what is inside the window (for fixing the skin after a patch)
+function DumpFrames(which)
+    if which == "geo" then return DumpGeo() end
+    local function Say(...) print("|cff33ff99BF frames:|r", ...) end
+    local function List(label, f)
+        if not f then Say(label, "not found") return end
+        Say(label, f:GetObjectType(), "children:", f:GetNumChildren(), "regions:", f:GetNumRegions())
+        local keys = {}
+        for k, v in pairs(f) do
+            if type(k) == "string" and type(v) == "table" and v.GetObjectType then
+                keys[#keys + 1] = k .. "=" .. v:GetObjectType()
+            end
+        end
+        table.sort(keys)
+        if #keys > 0 then Say("  keys:", table.concat(keys, ", ")) end
+    end
+    List("PVEFrame", PVEFrame)
+    List("GroupFinderFrame", GroupFinderFrame)
+    List("LFGListFrame", LFGListFrame)
+    if LFGListFrame then
+        for _, k in ipairs({ "CategorySelection", "SearchPanel", "EntryCreation", "ApplicationViewer" }) do
+            List("LFGListFrame." .. k, LFGListFrame[k])
+        end
+    end
+    for i = 1, 4 do
+        local t = _G["PVEFrameTab" .. i]
+        if t then Say("PVEFrameTab" .. i, tostring(t:GetText()), "enabled:", tostring(t:IsEnabled())) end
+    end
+end
+end   -- Skin
+
 local function TryInit()
     if initialized or not db then return end
     if not (LFGListFrame and LFGListFrame.SearchPanel and LFGListSearchPanel_UpdateResultList) then
@@ -4571,6 +6014,7 @@ local function TryInit()
         { "applicant panels", BuildApplicantPanels },
         { "Raider.IO support", InstallRaiderIOSupport },
         { "tooltip fix", InstallTooltipFix },
+        { "skin", InstallSkin },
     }
     for _, step in ipairs(steps) do
         local ok, err = pcall(step[2])
@@ -4617,3 +6061,187 @@ frame:SetScript("OnEvent", function(self, event, arg1)
         if db and db.partyFit then RefreshList() end
     end
 end)
+
+
+---------------------------------------------------------------------------
+-- /bf prog : what raid progress data this game and Raider.IO can give us (diagnostic)
+---------------------------------------------------------------------------
+function _G.BetterFiltersDumpProgress(msg)
+    local function Say(...) print("|cff33ff99BF prog:|r", ...) end
+
+    -- 1. the game's own comparison functions
+    for _, name in ipairs({ "SetAchievementComparisonUnit", "ClearAchievementComparisonUnit", "GetAchievementComparisonInfo",
+        "GetComparisonStatistic", "GetStatistic", "GetStatisticsCategoryList", "GetCategoryNumAchievements", "GetAchievementInfo" }) do
+        Say("function", name, type(_G[name]))
+    end
+    Say("C_AchievementInfo", type(_G.C_AchievementInfo), "C_ChallengeMode", type(_G.C_ChallengeMode))
+
+    -- 2. raid achievements (newest first)
+    if _G.GetCategoryList and _G.GetCategoryNumAchievements and _G.GetAchievementInfo then
+        local found = {}
+        for _, cat in ipairs(GetCategoryList()) do
+            for i = 1, (GetCategoryNumAchievements(cat) or 0) do
+                local id, name, _, completed = GetAchievementInfo(cat, i)
+                if id and name and (name:find("Ahead of the Curve", 1, true) or name:find("Cutting Edge", 1, true)) then
+                    found[#found + 1] = { id = id, name = name, done = completed, cat = cat }
+                end
+            end
+        end
+        table.sort(found, function(a, b) return a.id > b.id end)
+        Say("AotC / Cutting Edge achievements found:", #found, "(newest 14)")
+        for i = 1, math.min(14, #found) do
+            local f = found[i]
+            Say("  ", f.id, f.name, f.done and "(you have it)" or "(you do not)")
+        end
+    end
+
+    -- 3. statistics categories that look like the current raids
+    if _G.GetStatisticsCategoryList then
+        local names = {}
+        for _, cat in ipairs(GetStatisticsCategoryList()) do
+            local name = GetCategoryInfo and GetCategoryInfo(cat)
+            if name then names[#names + 1] = tostring(cat) .. "=" .. name end
+        end
+        Say("statistics categories:", #names)
+        Say(table.concat(names, ", "))
+    end
+
+    -- 4. Raider.IO: its profile for you, or for a name given after the command
+    local rio = _G.RaiderIO
+    Say("RaiderIO addon", rio and "loaded" or "not loaded")
+    if rio then
+        local keys = {}
+        for k, v in pairs(rio) do keys[#keys + 1] = tostring(k) .. "=" .. type(v) end
+        table.sort(keys)
+        Say("RaiderIO keys:", table.concat(keys, ", "))
+        local unit = "player"
+        local name, realm = (msg or ""):match("^%s*%S+%s+([^%s%-]+)%-?(%S*)")
+        local profile
+        if rio.GetProfile then
+            local ok, res
+            if name then ok, res = pcall(rio.GetProfile, name, realm ~= "" and realm or GetRealmName())
+            else ok, res = pcall(rio.GetProfile, unit) end
+            profile = ok and res or nil
+            if not ok then Say("GetProfile error:", res) end
+        end
+        if not profile then Say("no profile returned") return end
+        local lines, maxLines = 0, 70
+        local function Dump(t, indent, depth)
+            if type(t) ~= "table" or depth > 4 then return end
+            local keys2 = {}
+            for k in pairs(t) do keys2[#keys2 + 1] = k end
+            table.sort(keys2, function(a, b) return tostring(a) < tostring(b) end)
+            for _, k in ipairs(keys2) do
+                if lines >= maxLines then return end
+                local v = t[k]
+                if type(v) == "table" then
+                    lines = lines + 1
+                    Say(indent .. tostring(k) .. " = {")
+                    Dump(v, indent .. "  ", depth + 1)
+                else
+                    lines = lines + 1
+                    Say(indent .. tostring(k) .. " = " .. tostring(v))
+                end
+            end
+        end
+        -- the Encounter Journal: which functions exist and what they return for the first raid
+        local first = profile.raidProfile and profile.raidProfile.mainProgress and profile.raidProfile.mainProgress[1]
+        local raidInfo = first and first.raid
+        Say("EncounterJournal globals:", "EJ_GetInstanceForMap", type(_G.EJ_GetInstanceForMap),
+            "EJ_GetEncounterInfoByIndex", type(_G.EJ_GetEncounterInfoByIndex),
+            "C_EncounterJournal", type(_G.C_EncounterJournal))
+        if C_EncounterJournal then
+            local keys = {}
+            for k, v in pairs(C_EncounterJournal) do
+                if tostring(k):find("Instance") or tostring(k):find("Encounter") then keys[#keys + 1] = tostring(k) end
+            end
+            table.sort(keys)
+            Say("C_EncounterJournal:", table.concat(keys, ", "))
+        end
+        if raidInfo then
+            Say("first raid", raidInfo.name, "mapId", tostring(raidInfo.mapId), "id", tostring(raidInfo.id))
+            if type(raidInfo.dungeon) == "table" then
+                local dk = {}
+                for k, v in pairs(raidInfo.dungeon) do dk[#dk + 1] = tostring(k) .. "=" .. type(v) end
+                table.sort(dk)
+                Say("raid.dungeon has:", table.concat(dk, ", "))
+            end
+            for _, fn in ipairs({ { "C_EncounterJournal.GetInstanceForGameMap", C_EncounterJournal and C_EncounterJournal.GetInstanceForGameMap or false },
+                { "EJ_GetInstanceForMap", _G.EJ_GetInstanceForMap or false } }) do
+                if fn[2] then
+                    local ok, res = pcall(fn[2], raidInfo.mapId)
+                    Say(fn[1], "->", ok and tostring(res) or ("error: " .. tostring(res)))
+                    if ok and type(res) == "number" and res > 0 then
+                        for _, enc in ipairs({ { "C_EncounterJournal.GetEncounterInfoByIndex", C_EncounterJournal and C_EncounterJournal.GetEncounterInfoByIndex or false },
+                            { "EJ_GetEncounterInfoByIndex", _G.EJ_GetEncounterInfoByIndex or false } }) do
+                            if enc[2] then
+                                local ok2, a, b2 = pcall(enc[2], 1, res)
+                                Say("  ", enc[1], "(1) ->", ok2 and (type(a) == "table" and ("table name=" .. tostring(a.name)) or tostring(a)) or ("error: " .. tostring(a)))
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        Say("profile keys:")
+        local raid = profile.raidProfile
+        if raid then Say("raidProfile found"); Dump(raid, "  ", 1) else
+            local top = {}
+            for k, v in pairs(profile) do top[#top + 1] = tostring(k) .. "=" .. type(v) end
+            Say("no raidProfile; profile has:", table.concat(top, ", "))
+        end
+    end
+end
+
+
+-- /bf bosses [mapId] : every way of getting boss names, and what each gives (diagnostic)
+function _G.BetterFiltersDumpBosses(msg)
+    local function Say(...) print("|cff33ff99BF bosses:|r", ...) end
+    local map = tonumber((msg or ""):match("%d+")) or 3004
+    Say("map", map)
+    local ids = {}
+    if C_EncounterJournal and C_EncounterJournal.GetInstanceForGameMap then
+        local ok, id = pcall(C_EncounterJournal.GetInstanceForGameMap, map)
+        Say("C_EncounterJournal.GetInstanceForGameMap ->", ok and tostring(id) or ("error " .. tostring(id)))
+        if ok and type(id) == "number" and id > 0 then ids[#ids + 1] = id end
+    end
+    if EJ_GetInstanceForMap then
+        local ok, id = pcall(EJ_GetInstanceForMap, map)
+        Say("EJ_GetInstanceForMap ->", ok and tostring(id) or ("error " .. tostring(id)))
+        if ok and type(id) == "number" and id > 0 then ids[#ids + 1] = id end
+    end
+    for _, id in ipairs(ids) do
+        if EJ_GetInstanceInfo then
+            Say("EJ_GetInstanceInfo(" .. id .. ") ->", tostring((select(1, pcall(EJ_GetInstanceInfo, id)) and select(2, pcall(EJ_GetInstanceInfo, id)))))
+        end
+        if EJ_GetEncounterInfoByIndex then
+            local ok, a, b, c = pcall(EJ_GetEncounterInfoByIndex, 1, id)
+            Say("EJ_GetEncounterInfoByIndex(1, " .. id .. ") ->", ok and (tostring(a) .. " | " .. tostring(c)) or ("error " .. tostring(a)))
+        end
+        if EJ_SelectInstance and EJ_GetEncounterInfoByIndex then
+            local okS = pcall(EJ_SelectInstance, id)
+            local ok, a = pcall(EJ_GetEncounterInfoByIndex, 1)
+            Say("after EJ_SelectInstance(" .. id .. ") selected=" .. tostring(okS) .. ", EJ_GetEncounterInfoByIndex(1) ->", ok and tostring(a) or ("error " .. tostring(a)))
+        end
+    end
+    if C_EncounterJournal and C_EncounterJournal.GetEncountersOnMap then
+        local ok, list = pcall(C_EncounterJournal.GetEncountersOnMap, map)
+        Say("GetEncountersOnMap(" .. map .. ") ->", ok and (type(list) == "table" and (#list .. " entries") or tostring(list)) or ("error " .. tostring(list)))
+    end
+    -- by name: walk the journal's raids
+    if EJ_GetNumTiers and EJ_SelectTier and EJ_GetInstanceByIndex then
+        local found = 0
+        for t = 1, EJ_GetNumTiers() do
+            pcall(EJ_SelectTier, t)
+            for i = 1, 30 do
+                local ok, id, name = pcall(EJ_GetInstanceByIndex, i, true)
+                if not ok or not id then break end
+                if type(name) == "string" and (name:find("Venomous", 1, true) or name:find("Dreamrift", 1, true)) then
+                    Say("journal raid", id, name, "tier", t)
+                    found = found + 1
+                end
+            end
+        end
+        Say("journal raids found by name:", found)
+    end
+end
