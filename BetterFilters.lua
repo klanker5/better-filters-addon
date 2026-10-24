@@ -37,6 +37,8 @@ local defaults = {
     instantSignUp = true,       -- clicking a listing signs up straight away
     overviewMode = "ilvl",     -- Group Overview: "ilvl" | "class" | "tier" | "buff" | "prog"
     overviewRaid = 0,          -- Group Overview, Progress view: Raider.IO id of the raid shown
+    minimapAngle = 215,         -- where the minimap button sits (degrees around the minimap)
+    minimapHidden = false,
     reskin = true,              -- restyle the Dungeons & Raids window and put our panels inside it
     signUpRoles = {},           -- [classFile] = "TANK"|"HEALER"|"DAMAGER": role you sign up as
     signUpNote = "",            -- text put in the note box when you sign up to a group
@@ -4779,6 +4781,10 @@ SlashCmdList["BETTERFILTERS"] = function(msg)
     elseif (msg or ""):lower():match("^skin") then
         db.reskin = not (db.reskin ~= false)
         print("|cff33ff99BF:|r window skin " .. (db.reskin and "on" or "off") .. ". Type /reload to apply.")
+    elseif (msg or ""):lower():match("^minimap") then
+        db.minimapHidden = not db.minimapHidden
+        if _G.BetterFiltersMinimapButton then _G.BetterFiltersMinimapButton:SetShown(not db.minimapHidden) end
+        print("|cff33ff99BF:|r minimap button " .. (db.minimapHidden and "hidden" or "shown") .. ".")
     elseif (msg or ""):lower():match("^bosses") then
         local ok, err = pcall(_G.BetterFiltersDumpBosses, msg)
         if not ok then print("|cff33ff99BF:|r bosses error:", err) end
@@ -6039,6 +6045,7 @@ frame:SetScript("OnEvent", function(self, event, arg1)
         TryInit()
     elseif event == "PLAYER_LOGIN" then
         TryInit()
+        pcall(_G.BetterFiltersBuildMinimap)
         if C_MythicPlus and C_MythicPlus.RequestMapInfo then
             C_MythicPlus.RequestMapInfo()
         end
@@ -6244,4 +6251,82 @@ function _G.BetterFiltersDumpBosses(msg)
         end
         Say("journal raids found by name:", found)
     end
+end
+
+
+---------------------------------------------------------------------------
+-- Minimap button: opens the Group Overview. Drag it to move it around the minimap.
+---------------------------------------------------------------------------
+function _G.BetterFiltersBuildMinimap()
+    if _G.BetterFiltersMinimapButton or not Minimap or not db then return end
+    local b = CreateFrame("Button", "BetterFiltersMinimapButton", Minimap)
+    b:SetSize(31, 31)
+    b:SetFrameStrata("MEDIUM")
+    b:SetFrameLevel(8)
+    b:RegisterForClicks("LeftButtonUp")
+    b:RegisterForDrag("LeftButton")
+    b:SetHighlightTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
+
+    local background = b:CreateTexture(nil, "BACKGROUND")
+    background:SetSize(20, 20)
+    background:SetTexture("Interface\\Minimap\\UI-Minimap-Background")
+    background:SetPoint("TOPLEFT", 7, -5)
+    local icon = b:CreateTexture(nil, "ARTWORK")
+    icon:SetSize(17, 17)
+    icon:SetTexture("Interface\\AddOns\\BetterFilters\\icon")
+    icon:SetTexCoord(0.05, 0.95, 0.05, 0.95)
+    icon:SetPoint("TOPLEFT", 7, -6)
+    local border = b:CreateTexture(nil, "OVERLAY")
+    border:SetSize(53, 53)
+    border:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
+    border:SetPoint("TOPLEFT")
+
+    local function Place()
+        local a = math.rad(db.minimapAngle or 215)
+        local r = (Minimap:GetWidth() / 2) + 5
+        local x, y = math.cos(a) * r, math.sin(a) * r
+        local shape = GetMinimapShape and GetMinimapShape() or "ROUND"
+        if shape ~= "ROUND" then     -- square minimaps: follow the edge
+            x = math.max(-r, math.min(x * 1.4142, r))
+            y = math.max(-r, math.min(y * 1.4142, r))
+        end
+        b:ClearAllPoints()
+        b:SetPoint("CENTER", Minimap, "CENTER", x, y)
+    end
+
+    b:SetScript("OnDragStart", function(self)
+        self.dragging = true
+        GameTooltip:Hide()
+        self:SetScript("OnUpdate", function()
+            local mx, my = Minimap:GetCenter()
+            local px, py = GetCursorPosition()
+            local scale = Minimap:GetEffectiveScale()
+            if mx and px then
+                db.minimapAngle = math.deg(math.atan2(py / scale - my, px / scale - mx))
+                Place()
+            end
+        end)
+    end)
+    b:SetScript("OnDragStop", function(self)
+        self.dragging = nil
+        self:SetScript("OnUpdate", nil)
+    end)
+    b:SetScript("OnClick", function()
+        if ToggleOverview then
+            local ok, err = pcall(ToggleOverview)
+            if not ok then print("|cff33ff99BF:|r overview error:", err) end
+        end
+    end)
+    b:SetScript("OnEnter", function(self)
+        if self.dragging then return end
+        GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+        GameTooltip:SetText("Better Filters")
+        GameTooltip:AddLine("Left-click: Group Overview", 1, 1, 1)
+        GameTooltip:Show()
+    end)
+    b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    Place()
+    b:SetShown(not db.minimapHidden)
+    _G.BetterFiltersMinimapButton = b
 end
