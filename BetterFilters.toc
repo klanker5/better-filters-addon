@@ -2,7 +2,7 @@
 ## Title: Better Filters
 ## Notes: Filters the Premade Groups (LFG) search results by playstyle, score, roles, dungeon and raid boss, with notes on players.
 ## Author: klanker5
-## Version: 1.1.0
+## Version: 1.2.0
 ## IconTexture: Interface\AddOns\BetterFilters\icon
 ## SavedVariables: BetterFiltersDB
 

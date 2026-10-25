@@ -36,6 +36,7 @@ local defaults = {
     partyFit   = false,         -- only show groups with room for my party's roles
     instantSignUp = true,       -- clicking a listing signs up straight away
     overviewMode = "ilvl",     -- Group Overview: "ilvl" | "class" | "tier" | "buff" | "prog"
+    overviewLeft = false,      -- Group Overview: keep players who recently left the group
     overviewRaid = 0,          -- Group Overview, Progress view: Raider.IO id of the raid shown
     minimapAngle = 215,         -- where the minimap button sits (degrees around the minimap)
     minimapHidden = false,
@@ -3359,6 +3360,7 @@ local inspectSpec = {}       -- [guid] = specID read by inspecting
 local inspectTried = {}      -- [guid] = when we last tried to inspect them
 local pendingInspect         -- guid of the inspect in progress
 local overview               -- the popup (created on first open)
+local LF = { seen = {}, left = {} }   -- roster memory: who is here, and who recently left
 
 -- remember every applicant's item level, so we still know it once they have joined
 function CacheApplicantLevels()
@@ -3399,6 +3401,7 @@ local function OverviewMembers()
             local _, classFile = UnitClass(unit)
             if usable(name) and name and usable(classFile) and classFile then
                 local isMe = UnitIsUnit(unit, "player")
+                local fullName, fullRealm = UnitFullName(unit)
                 local role = UnitGroupRolesAssigned(unit)
                 if (role == nil or role == "NONE") and isMe then
                     local getSpec = (C_SpecializationInfo and C_SpecializationInfo.GetSpecialization) or GetSpecialization
@@ -3432,7 +3435,11 @@ local function OverviewMembers()
                     if not (usable(spec) and type(spec) == "string") then spec = nil end
                 end
                 if not (type(ilvl) == "number" and usable(ilvl) and ilvl > 0) then ilvl = nil end
-                out[#out + 1] = { unit = unit, name = name, class = classFile, role = role, ilvl = ilvl, spec = spec }
+                local guid = UnitGUID(unit)
+                out[#out + 1] = { unit = unit, name = name, class = classFile, role = role, ilvl = ilvl, spec = spec,
+                    guid = usable(guid) and guid or nil,
+                    fullName = usable(fullName) and fullName or nil,
+                    realm = usable(fullRealm) and fullRealm or nil }
             end
         end
     end
@@ -3443,8 +3450,45 @@ local function ClassName(file)
     return (LOCALIZED_CLASS_NAMES_MALE and LOCALIZED_CLASS_NAMES_MALE[file]) or file
 end
 
+local function LeftKey(m) return m.guid or m.fullName or m.name end
+
+-- compare the group against the last one we saw; whoever vanished has "recently left"
+function LF.Update()
+    if not IsInGroup() then
+        wipe(LF.seen); wipe(LF.left)
+        return
+    end
+    local now = {}
+    for _, m in ipairs(OverviewMembers()) do
+        local key = LeftKey(m)
+        if key then
+            now[key] = true
+            local copy = {}
+            for k, v in pairs(m) do copy[k] = v end
+            copy.unit = nil
+            LF.seen[key] = copy
+            LF.left[key] = nil          -- came back
+        end
+    end
+    for key, member in pairs(LF.seen) do
+        if not now[key] then
+            LF.left[key] = { member = member, when = GetTime() }
+            LF.seen[key] = nil
+        end
+    end
+end
+
+-- keep watching the group even while the window is closed
+do
+    local watcher = CreateFrame("Frame")
+    watcher:RegisterEvent("GROUP_ROSTER_UPDATE")
+    watcher:RegisterEvent("PLAYER_ENTERING_WORLD")
+    watcher:SetScript("OnEvent", function() pcall(LF.Update) end)
+end
+
 local function SortByIlvl(list)
     table.sort(list, function(a, b)
+        if (a.left and true or false) ~= (b.left and true or false) then return not a.left end
         if (a.ilvl or 0) ~= (b.ilvl or 0) then return (a.ilvl or 0) > (b.ilvl or 0) end
         return a.name < b.name
     end)
@@ -3526,10 +3570,14 @@ local function BuildOverviewGroups(members, mode)
     for _, g in ipairs(groups) do
         if #g.members > 0 then
             SortByIlvl(g.members)
-            local sum, n = 0, 0
+            local sum, n, present = 0, 0, 0
             for _, m in ipairs(g.members) do
-                if m.ilvl then sum = sum + m.ilvl; n = n + 1 end
+                if not m.left then
+                    present = present + 1
+                    if m.ilvl then sum = sum + m.ilvl; n = n + 1 end
+                end
             end
+            g.present = present
             g.avg = n > 0 and (sum / n) or nil
             out[#out + 1] = g
         end
@@ -3546,10 +3594,18 @@ local DIFF_LETTER = { [1] = "N", [2] = "H", [3] = "M" }
 local DIFF_NAME = { [1] = "Normal", [2] = "Heroic", [3] = "Mythic" }
 local DIFF_COLOR = { [1] = "1eff00", [2] = "a335ee", [3] = "ff8000" }
 
-function PG.Profile(unit)
+function PG.Profile(unit, fullName, realm)
     local rio = _G.RaiderIO
     if not (rio and rio.GetProfile) then return nil end
-    local ok, res = pcall(rio.GetProfile, unit)
+    local ok, res
+    if unit then
+        ok, res = pcall(rio.GetProfile, unit)
+    elseif fullName then
+        -- someone who has left: no unit any more, so by name
+        ok, res = pcall(rio.GetProfile, fullName, (realm and realm ~= "") and realm or GetRealmName())
+    else
+        return nil
+    end
     if ok and type(res) == "table" and type(res.raidProfile) == "table" then return res.raidProfile end
 end
 
@@ -3711,7 +3767,7 @@ function PG.Prepare(members)
     local byId, raids = {}, {}
     local anyProfile = false
     for _, m in ipairs(members) do
-        m.rp = PG.Profile(m.unit)
+        m.rp = PG.Profile(m.unit, m.fullName, m.realm)
         if m.rp then
             anyProfile = true
             EachRaidEntry(m.rp, function(e)
@@ -3754,8 +3810,8 @@ function PG.Prepare(members)
         end
         m.diffs = diffs
 
-        local state = PG.ach[UnitGUID(m.unit) or ""]
-        local isMe = UnitIsUnit(m.unit, "player")
+        local state = PG.ach[m.guid or ""]
+        local isMe = (not m.left) and m.unit and UnitIsUnit(m.unit, "player")
         m.aotc = aotcID and ((isMe and Done(aotcID)) or (state and state[aotcID])) or false
         m.ce = ceID and ((isMe and Done(ceID)) or (state and state[ceID])) or false
         m.achKnown = isMe or (state ~= nil)
@@ -3896,7 +3952,14 @@ local function OverviewLine(i)
     l.hl:SetAllPoints()
     l.hl:SetColorTexture(1, 0.82, 0, 0.12)
     l:SetScript("OnMouseUp", function(self, button)
-        if button ~= "LeftButton" or not self.unit then return end
+        if button ~= "LeftButton" then return end
+        if self.leftKey then                      -- a "Left" line: clicking clears it
+            LF.left[self.leftKey] = nil
+            self.leftKey = nil
+            if PG.refresh then PG.refresh() end
+            return
+        end
+        if not self.unit then return end
         local unit = self.unit
         if UnitGUID(unit) ~= self.guid then return end     -- the group changed
         if not (UnitIsConnected(unit) and CanInspect(unit)) then
@@ -3922,7 +3985,19 @@ local function RefreshOverview()
         b:SetState(b.key == mode and "sel" or "off", b.label)
     end
 
+    pcall(LF.Update)
     local members = OverviewMembers()
+    -- players who recently left, when asked for
+    if db.overviewLeft then
+        for _, entry in pairs(LF.left) do
+            local copy = {}
+            for k, v in pairs(entry.member) do copy[k] = v end
+            copy.unit, copy.left = nil, true
+            members[#members + 1] = copy
+        end
+    end
+    local present = 0
+    for _, m in ipairs(members) do if not m.left then present = present + 1 end end
     local progRaid, progData
     if mode == "prog" then progRaid, progData = PG.Prepare(members) end
     local groups = BuildOverviewGroups(members, mode)
@@ -3965,7 +4040,7 @@ local function RefreshOverview()
     if mode == "ilvl" then
         local sum, known = 0, 0
         for _, m in ipairs(members) do
-            if m.ilvl then sum = sum + m.ilvl; known = known + 1 end
+            if m.ilvl and not m.left then sum = sum + m.ilvl; known = known + 1 end
         end
         local l = Next(26)
         l.bg:SetColorTexture(1, 0.82, 0, 0.20)
@@ -3976,7 +4051,7 @@ local function RefreshOverview()
         l.head:SetTextColor(1, 1, 1)
         if known > 0 then
             l.head:SetText(("Average item level: |cffffd100%d|r"):format(math.floor(sum / known + 0.5))
-                .. (known < #members and ("  |cff999999(%d/%d known)|r"):format(known, #members) or ""))
+                .. (known < present and ("  |cff999999(%d/%d known)|r"):format(known, present) or ""))
         else
             l.head:SetText("Average item level: |cffffd100?|r")
         end
@@ -3994,7 +4069,7 @@ local function RefreshOverview()
         if twoRows then
             l.head:ClearAllPoints()
             l.head:SetPoint("TOPLEFT", 6, -3)
-            l.head:SetText(("%s (%d)"):format(g.title, #g.members))
+            l.head:SetText(("%s (%d)"):format(g.title, g.present or #g.members))
             l.ilvl:ClearAllPoints()
             l.ilvl:SetPoint("TOPRIGHT", -6, -4)
             l.sub:ClearAllPoints()
@@ -4003,7 +4078,7 @@ local function RefreshOverview()
             l.sub:SetText(g.sub)
             l.sub:Show()
         else
-            l.head:SetText(("%s (%d)%s"):format(g.title, #g.members, g.sub and ("  |cff999999" .. g.sub .. "|r") or ""))
+            l.head:SetText(("%s (%d)%s"):format(g.title, g.present or #g.members, g.sub and ("  |cff999999" .. g.sub .. "|r") or ""))
         end
         l.ilvl:SetTextColor(0.8, 0.8, 0.8)
         l.ilvl:SetText(g.avg and ("avg %d"):format(math.floor(g.avg + 0.5)) or "")
@@ -4011,8 +4086,9 @@ local function RefreshOverview()
         for _, m in ipairs(g.members) do
             local r = Next()
             r.bg:SetColorTexture(1, 1, 1, 0.03)
-            r.unit, r.guid = m.unit, UnitGUID(m.unit)
-            r.hl:SetShown(true)
+            r.unit, r.guid = m.unit, m.unit and UnitGUID(m.unit) or nil
+            r.hl:SetShown(m.unit ~= nil or m.left == true)
+            r.leftKey = m.left and LeftKey(m) or nil
             r.head:Hide()
             r.role:SetAtlas(ROLE_ATLAS[m.role]); r.role:Show()
             local c2 = RAID_CLASS_COLORS and RAID_CLASS_COLORS[m.class]
@@ -4029,6 +4105,13 @@ local function RefreshOverview()
                 r.ilvl:SetText(m.ilvl and ("%d"):format(math.floor(m.ilvl + 0.5)) or "?")
             end
             r.ilvl:Show()
+            if m.left then
+                r.bg:SetColorTexture(0.85, 0.15, 0.15, 0.28)
+                r.class:SetTextColor(1, 0.45, 0.45)
+                r.class:SetText("Left")
+                r.prog = nil
+                r.ilvl:SetText(m.ilvl and ("%d"):format(math.floor(m.ilvl + 0.5)) or "?")
+            end
         end
     end
 
@@ -4144,6 +4227,36 @@ local function CreateOverview()
     close:SetPoint("TOPRIGHT", overview, "TOPRIGHT", -8, -8)
     close:SetState("no", "x")
     close:SetScript("OnClick", function() overview:Hide() end)
+
+    -- "Recently Left" checkbox, top left (off by default)
+    local leftBox = CreateFrame("Button", nil, overview)
+    leftBox:SetSize(18, 18)
+    leftBox:SetPoint("TOPLEFT", overview, "TOPLEFT", 8, -8)
+    local boxEdge = leftBox:CreateTexture(nil, "BACKGROUND")
+    boxEdge:SetAllPoints()
+    boxEdge:SetColorTexture(unpack(THEME.border))
+    local boxBg = leftBox:CreateTexture(nil, "BORDER")
+    boxBg:SetPoint("TOPLEFT", 1, -1)
+    boxBg:SetPoint("BOTTOMRIGHT", -1, 1)
+    boxBg:SetColorTexture(unpack(THEME.bg))
+    local tick = leftBox:CreateTexture(nil, "ARTWORK")
+    tick:SetPoint("TOPLEFT", 4, -4)
+    tick:SetPoint("BOTTOMRIGHT", -4, 4)
+    tick:SetColorTexture(0.85, 0.2, 0.2, 1)
+    local function ApplyBox() tick:SetShown(db.overviewLeft and true or false) end
+    ApplyBox()
+    leftBox:SetScript("OnClick", function()
+        db.overviewLeft = not db.overviewLeft
+        ApplyBox()
+        RefreshOverview()
+    end)
+    leftBox:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Recently Left")
+        GameTooltip:AddLine("Keep players who left your group in the list, marked in red.", 1, 1, 1, true)
+        GameTooltip:Show()
+    end)
+    leftBox:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
     local divider = overview:CreateTexture(nil, "ARTWORK")
     divider:SetColorTexture(unpack(THEME.border))
@@ -4614,6 +4727,35 @@ local function InstallApplicantHooks()
     ev:RegisterEvent("LFG_LIST_ACTIVE_ENTRY_UPDATE")
     ev:SetScript("OnEvent", UpdateApplicantPanels)
 
+    -- Applicants who wrote a note with their sign-up get a gold tint, so you know there is
+    -- something to read without hovering them
+    local function ApplicantComment(appID)
+        local info = { C_LFGList.GetApplicantInfo(appID) }
+        local comment
+        if type(info[1]) == "table" then comment = info[1].comment else comment = info[6] end
+        if usable(comment) and type(comment) == "string" and comment:match("%S") then return true end
+        return false
+    end
+
+    local function NoteGlow(row, show)
+        local g = row.BFNoteGlow
+        if not g then
+            if not show then return end
+            g = {}
+            g.fill = row:CreateTexture(nil, "ARTWORK", nil, -8)
+            g.fill:SetAllPoints(row)
+            g.fill:SetColorTexture(1, 0.82, 0, 0.13)
+            g.bar = row:CreateTexture(nil, "ARTWORK", nil, -7)
+            g.bar:SetPoint("TOPLEFT", row, "TOPLEFT", 0, 0)
+            g.bar:SetPoint("BOTTOMLEFT", row, "BOTTOMLEFT", 0, 0)
+            g.bar:SetWidth(2)
+            g.bar:SetColorTexture(1, 0.82, 0, 0.9)
+            row.BFNoteGlow = g
+        end
+        g.fill:SetShown(show)
+        g.bar:SetShown(show)
+    end
+
     -- Also hide the rows themselves as the game draws them (works even where the
     -- list can't be rebuilt)
     if LFGListApplicationViewer_UpdateApplicantMember then
@@ -4624,6 +4766,7 @@ local function InstallApplicantHooks()
                 local kind = ListingKind()
                 local filtering = kind and db[Prefix(kind) .. "Enabled"]
                 row:SetShown(not filtering or ApplicantPasses(appID, kind))
+                NoteGlow(row, ApplicantComment(appID))
             end)
         end)
     end
