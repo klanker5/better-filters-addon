@@ -5110,8 +5110,14 @@ local function RaiseListingTooltip()
         after = appRaidPanel
     end
     if after and GameTooltip:IsShown() then
-        GameTooltip:ClearAllPoints()
-        GameTooltip:SetPoint("TOPLEFT", after, "TOPRIGHT", 6, 0)
+        -- fixed screen coordinates, never anchored to a frame: Raider.IO anchors its own
+        -- panel to this tooltip, so anchoring to its panel would make a loop
+        local right, top = after:GetRight(), after:GetTop()
+        if right and top and usable(right) and usable(top) then
+            local scale = after:GetEffectiveScale() / UIParent:GetEffectiveScale()
+            GameTooltip:ClearAllPoints()
+            GameTooltip:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", (right + 6) * scale, top * scale)
+        end
     end
 
     -- and keep it above Raider.IO's panel in case it still overlaps
