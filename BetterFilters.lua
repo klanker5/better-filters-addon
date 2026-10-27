@@ -33,6 +33,8 @@ local defaults = {
     raidTankMin = 0,   raidTankMax = RAID_TANK_MAX,
     raidHealerMin = 0, raidHealerMax = RAID_HEALER_MAX,
     raidDpsMin = 0,    raidDpsMax = RAID_DPS_MAX,
+    sortDungeon = "default",   -- listing order in dungeons: default | score | missing
+    sortRaid = "default",      -- listing order in raids: default | class | token
     partyFit   = false,         -- only show groups with room for my party's roles
     instantSignUp = true,       -- clicking a listing signs up straight away
     overviewMode = "ilvl",     -- Group Overview: "ilvl" | "class" | "tier" | "buff" | "prog"
@@ -621,6 +623,82 @@ local function PassesFilter(resultID, info, ctx)
         and MatchesBloodlust(resultID, info)
 end
 
+-- Sorting the listings -------------------------------------------------------------
+-- Each sort gives a number per group (smaller = earlier). Groups we can't read go last,
+-- and ties keep the game's own order.
+BetterFiltersSort = {}     -- (a global: the file is at its limit of local variables)
+BetterFiltersSort.options = {
+    dungeon = {
+        { key = "default", label = "Default", short = "Default" },
+        { key = "score", label = "Leader M+ score (highest first)", short = "M+ score" },
+        { key = "missing", label = "Missing members (fewest first)", short = "Missing" },
+    },
+    raid = {
+        { key = "default", label = "Default", short = "Default" },
+        { key = "class", label = "Same class as you (fewest first)", short = "Class" },
+        { key = "token", label = "Tier token count (fewest first)", short = "Tier token" },
+    },
+}
+
+function BetterFiltersSort.Value(sortKey, resultID, info)
+    if sortKey == "score" then
+        local score = info.leaderOverallDungeonScore
+        if score == nil then return 0 end                    -- no score: counts as 0
+        if not (usable(score) and type(score) == "number") then return nil end
+        return -score
+    elseif sortKey == "missing" then
+        local n = info.numMembers
+        if not (usable(n) and type(n) == "number") then return nil end
+        local maxPlayers = 5
+        local activityID = usable(info.activityIDs) and info.activityIDs and info.activityIDs[1] or info.activityID
+        if usable(activityID) and activityID then
+            local a = C_LFGList.GetActivityInfoTable(activityID)
+            if a and usable(a.maxNumPlayers) and a.maxNumPlayers > 0 then maxPlayers = a.maxNumPlayers end
+        end
+        return maxPlayers - n
+    elseif sortKey == "class" or sortKey == "token" then
+        local myClass = UnitClassBase and UnitClassBase("player")
+        local tokens = BetterFiltersSort.tokens      -- set where the table is defined, further down
+        local myToken = myClass and tokens and tokens[myClass]
+        if not myClass then return nil end
+        local n = info.numMembers
+        if not (usable(n) and type(n) == "number") then return nil end
+        local count = 0
+        for i = 1, n do
+            local _, classFile = GetMember(resultID, i)
+            if not (usable(classFile) and type(classFile) == "string") then return nil end
+            if sortKey == "class" then
+                if classFile == myClass then count = count + 1 end
+            elseif myToken and tokens[classFile] == myToken then
+                count = count + 1
+            end
+        end
+        return count
+    end
+end
+
+function BetterFiltersSort.Run(list, sortKey)
+    if not sortKey or sortKey == "default" or #list < 2 then return list end
+    local rows = {}
+    for i, resultID in ipairs(list) do
+        local info = C_LFGList.GetSearchResultInfo(resultID)
+        local ok, v = false, nil
+        if info then ok, v = pcall(BetterFiltersSort.Value, sortKey, resultID, info) end
+        rows[i] = { id = resultID, v = ok and v or nil, i = i }
+    end
+    table.sort(rows, function(a, b)
+        if a.v ~= b.v then
+            if a.v == nil then return false end
+            if b.v == nil then return true end
+            return a.v < b.v
+        end
+        return a.i < b.i
+    end)
+    local out = {}
+    for i, row in ipairs(rows) do out[i] = row.id end
+    return out
+end
+
 local function FilterResults(searchPanel)
     if not db or not db.enabled then return end
     if not searchPanel.results then return end
@@ -662,6 +740,11 @@ local function FilterResults(searchPanel)
         end
     end
 
+    if category == DUNGEON_CATEGORY_ID then
+        filtered = BetterFiltersSort.Run(filtered, db.sortDungeon)
+    elseif category == RAID_CATEGORY_ID then
+        filtered = BetterFiltersSort.Run(filtered, db.sortRaid)
+    end
     searchPanel.results = filtered
     searchPanel.totalResults = #filtered
 end
@@ -983,6 +1066,68 @@ end
 -- A button with three states, stored in db[key]:
 --   0 = grey (don't care), 1 = green (required), 2 = red (must not have)
 -- names = { off = "...", yes = "...", no = "..." } are the label texts.
+-- "Sort: x" dropdown for the listings; kind is "dungeon" or "raid"
+function BetterFiltersSort.Dropdown(parent, x, y, width, kind)
+    local key = (kind == "raid") and "sortRaid" or "sortDungeon"
+    local options = BetterFiltersSort.options[kind]
+    local b = MakeToggleButton(parent, x, y, width)
+
+    local function Current()
+        for _, o in ipairs(options) do
+            if o.key == db[key] then return o end
+        end
+        return options[1]
+    end
+    local function Apply()
+        b:SetState(db[key] ~= "default" and "sel" or "off", "Sort: " .. Current().short)
+    end
+
+    local menu = CreateFrame("Frame", nil, parent)
+    menu:SetFrameStrata("FULLSCREEN_DIALOG")
+    menu:SetPoint("TOPLEFT", b, "BOTTOMLEFT", 0, -2)
+    menu:SetSize(212, #options * 22)
+    menu:SetFrameLevel(parent:GetFrameLevel() + 20)
+    menu:Hide()
+    -- a gold outline and a solid dark back, so it stands out from the buttons underneath
+    local edge = menu:CreateTexture(nil, "BACKGROUND", nil, -2)
+    edge:SetPoint("TOPLEFT", -2, 2)
+    edge:SetPoint("BOTTOMRIGHT", 2, -2)
+    edge:SetColorTexture(1, 0.82, 0, 0.9)
+    local bg = menu:CreateTexture(nil, "BACKGROUND", nil, -1)
+    bg:SetAllPoints()
+    bg:SetColorTexture(0.03, 0.03, 0.04, 1)
+    menu.items = {}
+    for i, o in ipairs(options) do
+        local item = MakeToggleButton(menu, 0, -(i - 1) * 22, 212)
+        item:SetScript("OnClick", function()
+            db[key] = o.key
+            menu:Hide()
+            Apply()
+            RefreshList()
+        end)
+        menu.items[i] = item
+    end
+
+    b:SetScript("OnClick", function()
+        if menu:IsShown() then menu:Hide() return end
+        for i, o in ipairs(options) do
+            menu.items[i]:SetState(o.key == db[key] and "sel" or "off", o.label)
+        end
+        menu:Show()
+    end)
+    b:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Sort the listings")
+        GameTooltip:AddLine(Current().label, 1, 1, 1, true)
+        GameTooltip:Show()
+    end)
+    b:SetScript("OnLeave", GameTooltip_Hide)
+    parent:HookScript("OnHide", function() menu:Hide() end)
+    b.Refresh = Apply
+    Apply()
+    return b
+end
+
 local function MakeTriCheck(parent, x, y, key, names, onChange)
     local b = MakeToggleButton(parent, x, y, 212)
 
@@ -1414,6 +1559,35 @@ local function UpdateSpecIcons(entry)
     box:Show()
 end
 
+-- Dungeons: the leader's M+ score, just left of the group's spec icons
+local function UpdateLeaderScore(entry)
+    local fs = entry.BFLeaderScore
+    local function Off() if fs then fs:Hide() end end
+
+    local box = entry.SGFSpecs
+    if not (box and box:IsShown()) then return Off() end
+    local resultID = entry.resultID
+    if not (resultID and usable(resultID)) then return Off() end
+    local info = C_LFGList.GetSearchResultInfo(resultID)
+    local score = info and info.leaderOverallDungeonScore
+    if not (type(score) == "number" and usable(score) and score > 0) then return Off() end
+
+    if not fs then
+        fs = entry:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        entry.BFLeaderScore = fs
+    end
+    local color
+    if C_ChallengeMode and C_ChallengeMode.GetDungeonScoreRarityColor then
+        local ok, c = pcall(C_ChallengeMode.GetDungeonScoreRarityColor, score)
+        if ok and c and c.r then color = c end
+    end
+    if color then fs:SetTextColor(color.r, color.g, color.b) else fs:SetTextColor(1, 1, 1) end
+    fs:SetText(("%d"):format(score))
+    fs:ClearAllPoints()
+    fs:SetPoint("RIGHT", box, "LEFT", -8, 0)
+    fs:Show()
+end
+
 -- Raids: while you are signed up, show the group's role counts under the timer
 local raidSeen = {}           -- [resultID] = { leader, t, h, d } as last seen
 
@@ -1519,6 +1693,7 @@ TIER_TOKEN = {
     EVOKER = "Cast", HUNTER = "Cast", SHAMAN = "Cast",
     DEATHKNIGHT = "Forged", PALADIN = "Forged", WARRIOR = "Forged",
 }
+BetterFiltersSort.tokens = TIER_TOKEN
 
 local function UpdateRaidClassCount(entry)
     local fs = entry.SGFClassCount
@@ -1630,6 +1805,7 @@ function InstallSpecHooks()
     if LFGListSearchEntry_Update then
         hooksecurefunc("LFGListSearchEntry_Update", function(entry)
             pcall(UpdateSpecIcons, entry)
+            pcall(UpdateLeaderScore, entry)
             pcall(UpdateRaidComp, entry)
             pcall(UpdateRaidClassCount, entry)
             pcall(UpdateRoleIcon, entry)
@@ -2599,16 +2775,7 @@ local function BuildPanel()
     MakeNotesButton(panel, COL2, y)
     y = y - ROW_STEP
 
-    local partyCheck = MakeCheck(panel, "Fit my party", LEFT, y, "partyFit")
-    partyCheck:SetScript("OnEnter", function(self)
-        local r = GetPartyRoles()
-        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        GameTooltip:SetText("Fit my party")
-        GameTooltip:AddLine("Only shows groups with room for your party's roles.", 1, 1, 1, true)
-        GameTooltip:AddLine(("Your party now: %d tank, %d healer, %d dps"):format(r.TANK, r.HEALER, r.DAMAGER), 0.7, 0.7, 0.7)
-        GameTooltip:Show()
-    end)
-    partyCheck:SetScript("OnLeave", GameTooltip_Hide)
+    BetterFiltersSort.Dropdown(panel, LEFT, y, 104, "dungeon")
 
     local instantCheck = MakeCheck(panel, "Instant sign up", COL2, y, "instantSignUp")
     instantCheck:SetScript("OnEnter", function(self)
@@ -2692,6 +2859,17 @@ local function BuildPanel()
     y = y - ROW_STEP
     MakeTriCheck(panel, LEFT, y, "bloodlust",
         { off = "Bloodlust class", yes = "Has a bloodlust class", no = "No bloodlust class" })
+    y = y - ROW_STEP
+    local partyCheck = MakeCheck(panel, "Fit my party", LEFT, y, "partyFit", WIDTH)
+    partyCheck:SetScript("OnEnter", function(self)
+        local r = GetPartyRoles()
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Fit my party")
+        GameTooltip:AddLine("Only shows groups with room for your party's roles.", 1, 1, 1, true)
+        GameTooltip:AddLine(("Your party now: %d tank, %d healer, %d dps"):format(r.TANK, r.HEALER, r.DAMAGER), 0.7, 0.7, 0.7)
+        GameTooltip:Show()
+    end)
+    partyCheck:SetScript("OnLeave", GameTooltip_Hide)
     y = y - ROW_H - SECTION
 
     -- Dungeons -----------------------------------------------------------------
@@ -2823,7 +3001,8 @@ local function BuildRaidPanel()
     y = y - ROW_STEP
 
     -- Instant sign up -------------------------------------------------------------
-    local instantCheck = MakeCheck(p, "Instant sign up", LEFT, y, "instantSignUp", WIDTH)
+    BetterFiltersSort.Dropdown(p, LEFT, y, 104, "raid")
+    local instantCheck = MakeCheck(p, "Instant sign up", COL2, y, "instantSignUp")
     instantCheck:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
         GameTooltip:SetText("Instant sign up")
@@ -5844,9 +6023,17 @@ local nativeW, nativeH, lastFit
 local fitting = false
 local NARROW_W = 354
 
+-- our panels belong to the Premade Groups pages: one only counts while that page is on
+-- screen (after a /reload the applicants panel is "shown" while the Dungeon Finder is up)
+local function PanelOn(p)
+    if not (p and p:IsShown()) then return false end
+    local l = _G.LFGListFrame
+    return (l and l:IsVisible()) and true or false
+end
+
 local function AnyOurPanelShown()
     for _, p in ipairs({ panel, raidPanel, appPanel, appRaidPanel }) do
-        if p and p:IsShown() then return true end
+        if PanelOn(p) then return true end
     end
     return false
 end
@@ -5855,7 +6042,7 @@ end
 local function PanelHeight()
     local h = 0
     for _, p in ipairs({ panel, raidPanel, appPanel, appRaidPanel }) do
-        if p and p:IsShown() then h = math.max(h, p:GetHeight() or 0) end
+        if PanelOn(p) then h = math.max(h, p:GetHeight() or 0) end
     end
     return h
 end
@@ -5947,6 +6134,12 @@ local function DockPanel(p)
     p:SetPoint("TOPRIGHT", PVEFrame, "TOPRIGHT", 0, 0)
     p:HookScript("OnShow", function() pcall(FitWindow) end)
     p:HookScript("OnHide", function() C_Timer.After(0, function() pcall(FitWindow) end) end)
+    -- the page holding our panels showing or hiding changes the size too
+    if LFGListFrame and not LFGListFrame.BFFitHooked then
+        LFGListFrame.BFFitHooked = true
+        LFGListFrame:HookScript("OnShow", function() lastFit = nil; pcall(FitWindow) end)
+        LFGListFrame:HookScript("OnHide", function() lastFit = nil; pcall(FitWindow) end)
+    end
     -- some panels change height (the note box folding away): follow it
     hooksecurefunc(p, "SetHeight", function() if p:IsShown() then pcall(FitWindow) end end)
     if p:IsShown() then pcall(FitWindow) end
