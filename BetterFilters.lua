@@ -38,6 +38,7 @@ local defaults = {
     partyFit   = false,         -- only show groups with room for my party's roles
     instantSignUp = true,       -- clicking a listing signs up straight away
     overviewMode = "ilvl",     -- Group Overview: "ilvl" | "class" | "tier" | "buff" | "prog"
+    overviewBig = false,       -- Group Overview: enlarged (cogwheel button)
     overviewLeft = false,      -- Group Overview: keep players who recently left the group
     overviewRaid = 0,          -- Group Overview, Progress view: Raider.IO id of the raid shown
     minimapAngle = 215,         -- where the minimap button sits (degrees around the minimap)
@@ -4407,6 +4408,48 @@ local function CreateOverview()
     close:SetState("no", "x")
     close:SetScript("OnClick", function() overview:Hide() end)
 
+    -- cogwheel: makes the whole panel (size and text) 30% bigger, or back to normal
+    local OVERVIEW_BIG = 1.3
+    local cog
+    local function ApplyScale(big)
+        local old = overview:GetScale()
+        local new = big and OVERVIEW_BIG or 1
+        if math.abs(old - new) < 0.001 then return end
+        local right, top = overview:GetRight(), overview:GetTop()
+        local cx, cy = cog:GetCenter()
+        overview:SetScale(new)
+        if right and top and cx and cy then
+            -- the cogwheel stays under the mouse: the panel grows left and down from it
+            local dx, dy = cx - right, cy - top
+            overview:ClearAllPoints()
+            overview:SetPoint("TOPRIGHT", UIParent, "BOTTOMLEFT", cx * old / new - dx, cy * old / new - dy)
+        end
+    end
+    cog = MakeToggleButton(overview, 0, 0, 20)
+    cog:SetHeight(18)
+    cog:ClearAllPoints()
+    cog:SetPoint("RIGHT", close, "LEFT", -4, 0)
+    cog:SetState("off", "")
+    local cogIcon = cog:CreateTexture(nil, "OVERLAY")
+    cogIcon:SetSize(14, 14)
+    cogIcon:SetPoint("CENTER")
+    cogIcon:SetTexture("Interface\\Icons\\Trade_Engineering")
+    cogIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+    local function ApplyCog() cog:SetState(db.overviewBig and "sel" or "off", "") end
+    ApplyCog()
+    cog:SetScript("OnClick", function()
+        db.overviewBig = not db.overviewBig
+        ApplyCog()
+        ApplyScale(db.overviewBig)
+    end)
+    cog:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+        GameTooltip:SetText(db.overviewBig and "Normal size" or "Bigger")
+        GameTooltip:Show()
+    end)
+    cog:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    if db.overviewBig then overview:SetScale(OVERVIEW_BIG) end
+
     -- "Recently Left" checkbox, top left (off by default)
     local leftBox = CreateFrame("Button", nil, overview)
     leftBox:SetSize(18, 18)
@@ -4940,6 +4983,7 @@ local function InstallApplicantHooks()
     if LFGListApplicationViewer_UpdateApplicantMember then
         hooksecurefunc("LFGListApplicationViewer_UpdateApplicantMember", function(member, appID)
             pcall(function()
+                if LFGListFrame.BFAway then return end      -- browsing elsewhere: nothing to draw
                 local row = member and member:GetParent()
                 if not (row and appID and usable(appID)) then return end
                 local kind = ListingKind()
@@ -4952,10 +4996,119 @@ local function InstallApplicantHooks()
     if LFGListApplicationViewer_UpdateResults then
         hooksecurefunc("LFGListApplicationViewer_UpdateResults", function(self)
             pcall(CacheApplicantLevels)
-            pcall(ApplyApplicantFilter, self)
+            if not LFGListFrame.BFAway then pcall(ApplyApplicantFilter, self) end
         end)
     else
         print("|cff33ff99BF:|r the applicant list wasn't found, applicant filters are off.")
+    end
+
+    -- In a group somebody else has listed, the game hides the "Browse Groups" button:
+    -- bring it back so you can look for other groups while you wait.
+    local function ShowBrowseButton()
+        local viewer = LFGListFrame and LFGListFrame.ApplicationViewer
+        local b = viewer and viewer.BrowseGroupsButton
+        if not b then return end
+        if UnitIsGroupLeader("player", LE_PARTY_CATEGORY_HOME) then return end   -- leaders have it already
+        b:Show()
+        b:Enable()
+    end
+    if LFGListApplicationViewer_UpdateInfo then
+        hooksecurefunc("LFGListApplicationViewer_UpdateInfo", function() pcall(ShowBrowseButton) end)
+    end
+    local viewer = LFGListFrame and LFGListFrame.ApplicationViewer
+    if viewer and viewer.HookScript then
+        viewer:HookScript("OnShow", function() pcall(ShowBrowseButton) end)
+    end
+
+    -- The game puts the applicants page back every time the listing updates. Once you
+    -- have chosen to browse, stay on the list of groups until you go back yourself.
+    local browsing, reverting, lastPanel = false, false, nil
+    local browse = viewer and viewer.BrowseGroupsButton
+    if browse and browse.HookScript then
+        browse:HookScript("OnClick", function() browsing = true; LFGListFrame.BFAway = true end)
+    end
+    local back = LFGListFrame and LFGListFrame.SearchPanel and LFGListFrame.SearchPanel.BackToGroupButton
+    if back and back.HookScript then
+        -- PreClick: before the game switches pages, or our own revert would undo it
+        back:HookScript("PreClick", function() browsing = false; LFGListFrame.BFAway = false end)
+    end
+    if LFGListFrame_SetActivePanel then
+        hooksecurefunc("LFGListFrame_SetActivePanel", function(frame, panel)
+            if reverting then return end
+            -- the page you went to yourself (the list of groups, the categories...)
+            if panel and panel ~= LFGListFrame.ApplicationViewer then lastPanel = panel end
+            if not browsing then return end
+            pcall(function()
+                local f = LFGListFrame
+                -- the listing is over, or you lead it now: nothing to stay away from
+                if not C_LFGList.HasActiveEntryInfo() or UnitIsGroupLeader("player", LE_PARTY_CATEGORY_HOME) then
+                    browsing = false
+                    f.BFAway = false
+                    return
+                end
+                if panel == f.ApplicationViewer then
+                    reverting = true
+                    LFGListFrame_SetActivePanel(f, lastPanel or f.SearchPanel)
+                    reverting = false
+                end
+            end)
+            reverting = false
+        end)
+    end
+
+    -- While you have a listing, "Start a Group" on the main page becomes "View Group":
+    -- it takes you back to the applicants.
+    local cs = LFGListFrame and LFGListFrame.CategorySelection
+    local startBtn = cs and cs.StartGroupButton
+    if startBtn then
+        local origText, origClick = nil, startBtn:GetScript("OnClick")
+        local fixing = false
+        local function RefreshViewButton()
+            if fixing then return end
+            local listed = C_LFGList.HasActiveEntryInfo()
+            if not origText and startBtn:GetText() ~= "Back to Group" then origText = startBtn:GetText() end
+            fixing = true
+            if listed then
+                startBtn:SetText("Back to Group")
+                startBtn:Enable()
+                startBtn.tooltip = nil          -- "you must be the group leader"
+                startBtn.disabledTooltip = nil
+            elseif origText and startBtn:GetText() == "Back to Group" then
+                startBtn:SetText(origText)
+            end
+            fixing = false
+        end
+        -- the game greys the button out whenever the page updates: undo it straight away
+        for _, fn in ipairs({ "Disable", "SetEnabled", "SetText" }) do
+            if startBtn[fn] then
+                hooksecurefunc(startBtn, fn, function() pcall(RefreshViewButton) end)
+            end
+        end
+        startBtn:HookScript("OnEnter", function(self)
+            if C_LFGList.HasActiveEntryInfo() then
+                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                GameTooltip:SetText("Back to Group")
+                GameTooltip:AddLine("Return to your listing and its applicants.", 1, 1, 1, true)
+                GameTooltip:Show()
+            end
+        end)
+        startBtn:SetScript("OnClick", function(self, ...)
+            if C_LFGList.HasActiveEntryInfo() then
+                browsing = false
+                LFGListFrame.BFAway = false
+                LFGListFrame_SetActivePanel(LFGListFrame, LFGListFrame.ApplicationViewer)
+            elseif origClick then
+                origClick(self, ...)
+            end
+        end)
+        if LFGListCategorySelection_UpdateButtonStatus then
+            hooksecurefunc("LFGListCategorySelection_UpdateButtonStatus", function() pcall(RefreshViewButton) end)
+        end
+        cs:HookScript("OnShow", function() pcall(RefreshViewButton) end)
+        local ev = CreateFrame("Frame")
+        ev:RegisterEvent("LFG_LIST_ACTIVE_ENTRY_UPDATE")
+        ev:SetScript("OnEvent", function() pcall(RefreshViewButton) end)
+        pcall(RefreshViewButton)
     end
 end
 
