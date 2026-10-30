@@ -3728,7 +3728,7 @@ local function BuildOverviewGroups(members, mode)
                 Add("none", "No raid buff", nil, nil, m)
             end
         end
-    elseif mode == "prog" then
+    elseif mode == "prog" or mode == "parse" then
         for _, m in ipairs(members) do
             if m.pkey then
                 Add(m.pkey, m.ptitle, nil, m.pcolor, m)
@@ -3749,12 +3749,22 @@ local function BuildOverviewGroups(members, mode)
     local out = {}
     for _, g in ipairs(groups) do
         if #g.members > 0 then
-            SortByIlvl(g.members)
+            if mode == "parse" then
+                table.sort(g.members, function(a, b)
+                    if (a.left and true or false) ~= (b.left and true or false) then return not a.left end
+                    if (a.pvalue or -1) ~= (b.pvalue or -1) then return (a.pvalue or -1) > (b.pvalue or -1) end
+                    return a.name < b.name
+                end)
+            else
+                SortByIlvl(g.members)
+            end
             local sum, n, present = 0, 0, 0
             for _, m in ipairs(g.members) do
                 if not m.left then
                     present = present + 1
-                    if m.ilvl then sum = sum + m.ilvl; n = n + 1 end
+                    local v = m.ilvl
+                    if mode == "parse" then v = m.pvalue end     -- the parse view averages parses
+                    if v then sum = sum + v; n = n + 1 end
                 end
             end
             g.present = present
@@ -4093,6 +4103,105 @@ function PG.Tooltip(line)
     GameTooltip:Show()
 end
 
+-- Parses view: Archon Tooltip's data on each player, grouped by parse colour
+local PARSE_BRACKETS = {
+    { min = 99, title = "99 - 100", color = { 0.89, 0.41, 0.66 } },
+    { min = 95, title = "95 - 98",  color = { 1, 0.5, 0 } },
+    { min = 75, title = "75 - 94",  color = { 0.64, 0.21, 0.93 } },
+    { min = 50, title = "50 - 74",  color = { 0, 0.44, 1 } },
+    { min = 25, title = "25 - 49",  color = { 0.12, 1, 0 } },
+    { min = 0,  title = "0 - 24",   color = { 0.6, 0.6, 0.6 } },
+}
+local PARSE_DIFF = { [3] = "Normal", [4] = "Heroic", [5] = "Mythic" }
+local PARSE_LETTER = { [3] = "N", [4] = "H", [5] = "M" }
+local PARSE_CLASSKEY = { DEATHKNIGHT = "DeathKnight", DEMONHUNTER = "DemonHunter" }
+
+function PG.ParseAvailable()
+    return _G.ArchonTooltip and type(_G.ArchonTooltip.GetProfile) == "function"
+end
+
+local function ParseHex(v)
+    for _, b in ipairs(PARSE_BRACKETS) do
+        if v >= b.min then return ("%02x%02x%02x"):format(b.color[1] * 255, b.color[2] * 255, b.color[3] * 255) end
+    end
+    return "999999"
+end
+
+-- the section with the hardest difficulty that has a parse
+local function BestSection(profile)
+    local best
+    if type(profile.sections) ~= "table" then return nil end
+    for _, sec in pairs(profile.sections) do
+        if type(sec) == "table" and type(sec.anySpecRankings) == "table"
+            and type(sec.anySpecRankings.bestAverage) == "number" then
+            if not best or (sec.difficultyId or 0) > (best.difficultyId or 0) then best = sec end
+        end
+    end
+    return best
+end
+
+function PG.ParsePrepare(members)
+    local AT = _G.ArchonTooltip
+    for _, m in ipairs(members) do
+        m.pkey, m.ptitle, m.prank, m.pcolor, m.pvalue, m.ptags, m.psummary, m.psection = nil
+        local name = m.fullName or m.name
+        local realm = (m.realm and m.realm ~= "") and m.realm or (GetNormalizedRealmName and GetNormalizedRealmName())
+        local ok, profile = false, nil
+        if AT and name and realm then ok, profile = pcall(AT.GetProfile, name, realm) end
+        local sec = (ok and type(profile) == "table") and BestSection(profile) or nil
+        if sec then
+            local entry = sec.anySpecRankings
+            -- the player's current spec, when we know it and Archon has it
+            if m.spec and type(sec.perSpecRankings) == "table" then
+                local want = (PARSE_CLASSKEY[m.class] or (m.class:sub(1, 1) .. m.class:sub(2):lower())) .. "-" .. (m.spec:gsub("%s", ""))
+                for _, e in pairs(sec.perSpecRankings) do
+                    if type(e) == "table" and e.spec == want and type(e.bestAverage) == "number" then entry = e end
+                end
+            end
+            local v = math.floor(entry.bestAverage + 0.0001)
+            m.pvalue, m.psection = entry.bestAverage, sec
+            for _, b in ipairs(PARSE_BRACKETS) do
+                if v >= b.min then
+                    m.pkey, m.ptitle, m.prank, m.pcolor = "p" .. b.min, b.title, b.min, b.color
+                    break
+                end
+            end
+            local d = sec.difficultyId
+            local progress = (type(entry.progressKilled) == "number" and type(entry.progressPossible) == "number")
+                and (" %d/%d"):format(entry.progressKilled, entry.progressPossible) or ""
+            m.ptags = (PARSE_DIFF[d] or "?") .. progress
+            m.psummary = ("|cff%s%.1f|r"):format(ParseHex(v), entry.bestAverage)
+        else
+            m.pkey, m.ptitle, m.prank, m.pcolor = "none", "No parses", -1, { 0.6, 0.6, 0.6 }
+            m.ptags, m.psummary = "", ""
+        end
+    end
+end
+
+function PG.ParseTooltip(line)
+    local m = line.parse
+    if not (m and m.psection) then return end
+    GameTooltip:SetOwner(line, "ANCHOR_RIGHT")
+    GameTooltip:SetText(m.name .. " - Parses")
+    local sec = m.psection
+    GameTooltip:AddDoubleLine(PARSE_DIFF[sec.difficultyId] or "?", ("%d kills"):format(sec.totalKills or 0), 1, 0.82, 0, 0.8, 0.8, 0.8)
+    local any = sec.anySpecRankings
+    if type(any.bestAverage) == "number" then
+        GameTooltip:AddDoubleLine("Best average (any spec)", ("%.1f"):format(any.bestAverage), 1, 1, 1, 1, 1, 1)
+    end
+    if type(sec.perSpecRankings) == "table" then
+        for _, e in pairs(sec.perSpecRankings) do
+            if type(e) == "table" and type(e.bestAverage) == "number" then
+                GameTooltip:AddDoubleLine(tostring(e.spec or "?"), ("%.1f"):format(e.bestAverage), 0.8, 0.8, 0.8, 1, 1, 1)
+            end
+        end
+    end
+    if type(any.allStarRank) == "number" then
+        GameTooltip:AddDoubleLine("All-star rank", tostring(any.allStarRank), 0.8, 0.8, 0.8, 1, 1, 1)
+    end
+    GameTooltip:Show()
+end
+
 local OVERVIEW_W, OVERVIEW_LINE = 340, 18
 local OVERVIEW_MODES = {
     { key = "ilvl",  label = "Ilvl" },
@@ -4149,7 +4258,9 @@ local function OverviewLine(i)
         local ok, err = pcall(InspectUnit, unit)
         if not ok then print("|cff33ff99BF:|r couldn't inspect:", err) end
     end)
-    l:SetScript("OnEnter", function(self) if self.prog then pcall(PG.Tooltip, self) end end)
+    l:SetScript("OnEnter", function(self)
+        if self.prog then pcall(PG.Tooltip, self) elseif self.parse then pcall(PG.ParseTooltip, self) end
+    end)
     l:SetScript("OnLeave", function() GameTooltip:Hide() end)
     l.sub = l:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     l.sub:SetJustifyH("LEFT")
@@ -4161,6 +4272,7 @@ end
 local function RefreshOverview()
     if not (overview and overview:IsShown()) then return end
     local mode = db.overviewMode
+    if mode == "parse" and not PG.ParseAvailable() then mode = "ilvl" end
     for _, b in ipairs(overview.modeButtons) do
         b:SetState(b.key == mode and "sel" or "off", b.label)
     end
@@ -4180,6 +4292,7 @@ local function RefreshOverview()
     for _, m in ipairs(members) do if not m.left then present = present + 1 end end
     local progRaid, progData
     if mode == "prog" then progRaid, progData = PG.Prepare(members) end
+    if mode == "parse" then PG.ParsePrepare(members) end
     local groups = BuildOverviewGroups(members, mode)
 
     -- the raid picker only belongs to the Progress view
@@ -4209,7 +4322,7 @@ local function RefreshOverview()
         l.head:SetWordWrap(false)
         l.sub:Hide()
         l.head:SetFontObject("GameFontNormal")
-        l.unit, l.guid, l.prog = nil, nil, nil
+        l.unit, l.guid, l.prog, l.parse, l.leftKey = nil, nil, nil, nil, nil
         l.hl:SetShown(false)
         l.ilvl:ClearAllPoints()
         l.ilvl:SetPoint("RIGHT", -6, 0)
@@ -4281,6 +4394,10 @@ local function RefreshOverview()
                 r.prog = m
                 r.class:SetText(m.ptags ~= "" and m.ptags or (m.spec or ClassName(m.class)))
                 r.ilvl:SetText(m.psummary ~= "" and m.psummary or "")
+            elseif mode == "parse" then
+                r.parse = m.psection and m or nil
+                r.class:SetText(m.ptags ~= "" and m.ptags or (m.spec or ClassName(m.class)))
+                r.ilvl:SetText(m.psummary ~= "" and m.psummary or "-")
             else
                 r.ilvl:SetText(m.ilvl and ("%d"):format(math.floor(m.ilvl + 0.5)) or "?")
             end
@@ -4289,7 +4406,7 @@ local function RefreshOverview()
                 r.bg:SetColorTexture(0.85, 0.15, 0.15, 0.28)
                 r.class:SetTextColor(1, 0.45, 0.45)
                 r.class:SetText("Left")
-                r.prog = nil
+                r.prog, r.parse = nil, nil
                 r.ilvl:SetText(m.ilvl and ("%d"):format(math.floor(m.ilvl + 0.5)) or "?")
             end
         end
@@ -4489,6 +4606,11 @@ local function CreateOverview()
     -- how to group
     overview.modeButtons = {}
     local gap = 4
+    -- the Parses tab only exists when Archon Tooltip is installed
+    if PG.ParseAvailable() and not OVERVIEW_MODES.parsed then
+        OVERVIEW_MODES.parsed = true
+        OVERVIEW_MODES[#OVERVIEW_MODES + 1] = { key = "parse", label = "Parses" }
+    end
     local w = (OVERVIEW_W - gap * (#OVERVIEW_MODES - 1)) / #OVERVIEW_MODES
     for i, mode in ipairs(OVERVIEW_MODES) do
         local b = MakeToggleButton(overview, 12 + (i - 1) * (w + gap), -42, w)
@@ -5259,6 +5381,11 @@ SlashCmdList["BETTERFILTERS"] = function(msg)
     elseif (msg or ""):lower():match("^minimap") then
         db.minimapHidden = not db.minimapHidden
         if _G.BetterFiltersMinimapButton then _G.BetterFiltersMinimapButton:SetShown(not db.minimapHidden) end
+        local DBI = _G.LibStub and LibStub("LibDBIcon-1.0", true)
+        if _G.BetterFiltersUsesDBI and DBI then
+            db.minimapIcon.hide = db.minimapHidden
+            if db.minimapHidden then DBI:Hide("BetterFilters") else DBI:Show("BetterFilters") end
+        end
         print("|cff33ff99BF:|r minimap button " .. (db.minimapHidden and "hidden" or "shown") .. ".")
     elseif (msg or ""):lower():match("^bosses") then
         local ok, err = pcall(_G.BetterFiltersDumpBosses, msg)
@@ -6753,7 +6880,39 @@ end
 -- Minimap button: opens the Group Overview. Drag it to move it around the minimap.
 ---------------------------------------------------------------------------
 function _G.BetterFiltersBuildMinimap()
-    if _G.BetterFiltersMinimapButton or not Minimap or not db then return end
+    if _G.BetterFiltersMinimapButton or _G.BetterFiltersUsesDBI or not Minimap or not db then return end
+
+    -- With LibDataBroker around (Bazooka, Titan Panel and others bring it), Better Filters
+    -- is offered to those bars as a launcher. With LibDBIcon too, the minimap button is
+    -- the standard one that button collectors (ElvUI, Ellesmere UI...) know how to handle.
+    local LibStub = _G.LibStub
+    local LDB = LibStub and LibStub("LibDataBroker-1.1", true)
+    local DBI = LibStub and LibStub("LibDBIcon-1.0", true)
+    local function OpenOverview()
+        if ToggleOverview then
+            local ok, err = pcall(ToggleOverview)
+            if not ok then print("|cff33ff99BF:|r overview error:", err) end
+        end
+    end
+    if LDB then
+        local obj = LDB:GetDataObjectByName("BetterFilters") or LDB:NewDataObject("BetterFilters", {
+            type = "launcher",
+            text = "Better Filters",
+            icon = "Interface\\AddOns\\BetterFilters\\icon",
+            OnClick = function() OpenOverview() end,
+            OnTooltipShow = function(tooltip)
+                tooltip:AddLine("Better Filters")
+                tooltip:AddLine("Left-click: Group Overview", 1, 1, 1)
+            end,
+        })
+        if DBI and obj then
+            db.minimapIcon = db.minimapIcon or { hide = db.minimapHidden, minimapPos = db.minimapAngle }
+            DBI:Register("BetterFilters", obj, db.minimapIcon)
+            _G.BetterFiltersUsesDBI = true
+            return
+        end
+    end
+
     local b = CreateFrame("Button", "BetterFiltersMinimapButton", Minimap)
     b:SetSize(31, 31)
     b:SetFrameStrata("MEDIUM")
@@ -6777,6 +6936,8 @@ function _G.BetterFiltersBuildMinimap()
     border:SetPoint("TOPLEFT")
 
     local function Place()
+        -- a button collector (Ellesmere UI, ElvUI...) has taken the button: it places it now
+        if b:GetParent() ~= Minimap then return end
         local a = math.rad(db.minimapAngle or 215)
         local r = (Minimap:GetWidth() / 2) + 5
         local x, y = math.cos(a) * r, math.sin(a) * r
@@ -6790,6 +6951,7 @@ function _G.BetterFiltersBuildMinimap()
     end
 
     b:SetScript("OnDragStart", function(self)
+        if self:GetParent() ~= Minimap then return end       -- in a collector's bar: it stays put
         self.dragging = true
         GameTooltip:Hide()
         self:SetScript("OnUpdate", function()
