@@ -1802,6 +1802,47 @@ local function UpdateRoleIcon(entry)
     icon:Show()
 end
 
+-- Dungeons: a row you applied to turns orange, with "Role Filled" in the middle, once the
+-- group has what it needs for your role (1 tank, 1 healer, 3 dps)
+local ROLE_FULL = { TANK = 1, HEALER = 1, DAMAGER = 3 }
+
+local function UpdateRoleFilled(entry)
+    local tint, label = entry.BFFilledTint, entry.BFFilledText
+    local function Off()
+        if tint then tint:Hide() end
+        if label then label:Hide() end
+    end
+
+    local searchPanel = LFGListFrame and LFGListFrame.SearchPanel
+    if not searchPanel or searchPanel.categoryID ~= DUNGEON_CATEGORY_ID then return Off() end
+    local resultID = entry.resultID
+    if not (resultID and usable(resultID)) then return Off() end
+
+    local _, status, _, _, role = C_LFGList.GetApplicationInfo(resultID)
+    if not (usable(status) and status == "applied") then return Off() end        -- still pending only
+    if not (usable(role) and role and ROLE_FULL[role]) then role = appliedRole[resultID] end
+    if not (role and ROLE_FULL[role]) then return Off() end
+
+    local counts = C_LFGList.GetSearchResultMemberCounts(resultID)
+    local have = counts and counts[role]
+    if not (usable(have) and type(have) == "number") then return Off() end
+    if have < ROLE_FULL[role] then return Off() end
+
+    if not tint then
+        tint = entry:CreateTexture(nil, "ARTWORK", nil, 5)
+        tint:SetAllPoints()
+        entry.BFFilledTint = tint
+        label = entry:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+        label:SetPoint("CENTER", entry, "CENTER", 0, 0)
+        label:SetText("Role Filled")
+        label:SetTextColor(1, 0.55, 0.1)
+        entry.BFFilledText = label
+    end
+    tint:SetColorTexture(1, 0.5, 0, 0.22)
+    tint:Show()
+    label:Show()
+end
+
 function InstallSpecHooks()
     if LFGListSearchEntry_Update then
         hooksecurefunc("LFGListSearchEntry_Update", function(entry)
@@ -1810,6 +1851,7 @@ function InstallSpecHooks()
             pcall(UpdateRaidComp, entry)
             pcall(UpdateRaidClassCount, entry)
             pcall(UpdateRoleIcon, entry)
+            pcall(UpdateRoleFilled, entry)
         end)
     end
     -- remember the role each application was sent with (the game may not tell us later)
