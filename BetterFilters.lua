@@ -3806,6 +3806,7 @@ local function BuildOverviewGroups(members, mode)
                     present = present + 1
                     local v = m.ilvl
                     if mode == "parse" then v = m.pvalue end     -- the parse view averages parses
+                    if mode == "mplus" then v = m.mscore end     -- the M+ view averages scores
                     if v then sum = sum + v; n = n + 1 end
                 end
             end
@@ -3826,7 +3827,8 @@ local DIFF_LETTER = { [1] = "N", [2] = "H", [3] = "M" }
 local DIFF_NAME = { [1] = "Normal", [2] = "Heroic", [3] = "Mythic" }
 local DIFF_COLOR = { [1] = "1eff00", [2] = "a335ee", [3] = "ff8000" }
 
-function PG.Profile(unit, fullName, realm)
+-- everything Raider.IO has on a player (its raidProfile, mythicKeystoneProfile...)
+function PG.ProfileFull(unit, fullName, realm)
     local rio = _G.RaiderIO
     if not (rio and rio.GetProfile) then return nil end
     local ok, res
@@ -3838,7 +3840,12 @@ function PG.Profile(unit, fullName, realm)
     else
         return nil
     end
-    if ok and type(res) == "table" and type(res.raidProfile) == "table" then return res.raidProfile end
+    if ok and type(res) == "table" then return res end
+end
+
+function PG.Profile(unit, fullName, realm)
+    local res = PG.ProfileFull(unit, fullName, realm)
+    if res and type(res.raidProfile) == "table" then return res.raidProfile end
 end
 
 local function EachRaidEntry(profile, fn)
@@ -4244,14 +4251,256 @@ function PG.ParseTooltip(line)
     GameTooltip:Show()
 end
 
-local OVERVIEW_W, OVERVIEW_LINE = 340, 18
+local OVERVIEW_W, OVERVIEW_LINE = 408, 18
 local OVERVIEW_MODES = {
     { key = "ilvl",  label = "Ilvl" },
     { key = "class", label = "Class" },
     { key = "tier",  label = "Tier Set" },
     { key = "buff",  label = "Raid Buff" },
     { key = "prog",  label = "Progress" },
+    { key = "mplus", label = "M+" },
 }
+
+-- which tabs show: Progress in a raid, M+ in a party or alone, Parses when Archon Tooltip is there
+function PG.ModeOk(key)
+    if key == "prog" then return IsInRaid() end
+    if key == "mplus" then return not IsInRaid() end            -- in a party or alone
+    if key == "parse" then return PG.ParseAvailable() and true or false end
+    return true
+end
+
+-- the tabs that apply now are spread over the full width
+function PG.LayoutModes()
+    local shown = {}
+    for _, b in ipairs(overview.modeButtons) do
+        if PG.ModeOk(b.key) then shown[#shown + 1] = b else b:Hide() end
+    end
+    if #shown == 0 then return end
+    local gap = 4
+    local w = (OVERVIEW_W - gap * (#shown - 1)) / #shown
+    for i, b in ipairs(shown) do
+        b:ClearAllPoints()
+        b:SetPoint("TOPLEFT", overview, "TOPLEFT", 12 + (i - 1) * (w + gap), -42)
+        b:SetWidth(w)
+        b.text:SetWidth(w - 8)
+        b:Show()
+    end
+end
+
+-- M+ view: the best key of each member in each dungeon of the season
+local MP_COL0 = 150                       -- where the dungeon columns start on a line
+
+function PG.MapList()
+    if PG.maps and #PG.maps > 0 then return PG.maps end
+    local list = {}
+    local ids = C_ChallengeMode and C_ChallengeMode.GetMapTable and C_ChallengeMode.GetMapTable()
+    if type(ids) == "table" then
+        for _, id in ipairs(ids) do
+            local name = C_ChallengeMode.GetMapUIInfo(id)
+            if usable(name) and type(name) == "string" then
+                local short = Abbreviate(name)      -- the same short names as the dungeon filters
+                list[#list + 1] = { id = id, name = name, short = short }
+            end
+        end
+    end
+    PG.maps = list
+    return list
+end
+
+-- best key of a member in each dungeon: m.mruns[mapID] = { level, timed }, m.mscore = season score
+function PG.MPlusPrepare(members)
+    local maps = PG.MapList()
+    for _, m in ipairs(members) do
+        local runs, score = {}, nil
+        local isMe = (not m.left) and m.unit and UnitIsUnit(m.unit, "player")
+        local function Put(id, level, timed)
+            if not (usable(id) and usable(level) and type(level) == "number" and level > 0) then return end
+            local cur = runs[id]
+            if not cur or level > cur.level or (level == cur.level and timed and not cur.timed) then
+                runs[id] = { level = level, timed = timed and true or false }
+            end
+        end
+        -- the game's own rating summary (works for the people in your group)
+        if m.unit and C_PlayerInfo and C_PlayerInfo.GetPlayerMythicPlusRatingSummary then
+            local ok, sum = pcall(C_PlayerInfo.GetPlayerMythicPlusRatingSummary, m.unit)
+            if ok and type(sum) == "table" then
+                if usable(sum.currentSeasonScore) and type(sum.currentSeasonScore) == "number" then score = sum.currentSeasonScore end
+                if type(sum.runs) == "table" then
+                    for _, run in ipairs(sum.runs) do
+                        if type(run) == "table" then Put(run.challengeModeID, run.bestRunLevel, run.finishedSuccess) end
+                    end
+                end
+            end
+        end
+        -- yourself: your own season bests
+        if isMe and C_MythicPlus and C_MythicPlus.GetSeasonBestForMap then
+            for _, map in ipairs(maps) do
+                local ok, inTime, overTime = pcall(C_MythicPlus.GetSeasonBestForMap, map.id)
+                if ok then
+                    if type(inTime) == "table" then Put(map.id, inTime.level, true) end
+                    if type(overTime) == "table" then Put(map.id, overTime.level, false) end
+                end
+            end
+            if C_ChallengeMode and C_ChallengeMode.GetOverallDungeonScore then
+                local ok, v = pcall(C_ChallengeMode.GetOverallDungeonScore)
+                if ok and usable(v) and type(v) == "number" and not score then score = v end
+            end
+        end
+        -- Raider.IO, when the game gave nothing
+        if next(runs) == nil then
+            local rp = PG.ProfileFull(m.unit, m.fullName, m.realm)
+            local mk = rp and rp.mythicKeystoneProfile
+            if mk and not score and type(mk.currentScore) == "number" then score = mk.currentScore end
+            local list = mk and mk.sortedDungeons
+            if type(list) == "table" then
+                for _, e in pairs(list) do
+                    if type(e) == "table" and type(e.dungeon) == "table" then
+                        Put(e.dungeon.keystone_instance or e.dungeon.id, e.level, (e.chests or 0) > 0)
+                    end
+                end
+            end
+        end
+        m.mruns, m.mscore = runs, score
+    end
+    PG.mplusMembers = members
+end
+
+-- colour of a key level: by level when timed (as in the table), grey when not
+function PG.KeyColor(run)
+    if not run.timed then return 0.55, 0.55, 0.55 end
+    if C_ChallengeMode and C_ChallengeMode.GetKeystoneLevelRarityColor then
+        local ok, c = pcall(C_ChallengeMode.GetKeystoneLevelRarityColor, run.level)
+        if ok and c and c.r then return c.r, c.g, c.b end
+    end
+    return 1, 1, 1
+end
+
+function PG.MPlusTooltip(line)
+    local m = line.mplus
+    if not m then return end
+    GameTooltip:SetOwner(line, "ANCHOR_RIGHT")
+    GameTooltip:SetText(m.name)
+    if m.mscore then GameTooltip:AddDoubleLine("Season score", ("%d"):format(m.mscore), 0.8, 0.8, 0.8, 1, 1, 1) end
+    for _, map in ipairs(PG.MapList()) do
+        local run = m.mruns and m.mruns[map.id]
+        if run then
+            local cr, cg, cb = PG.KeyColor(run)
+            GameTooltip:AddDoubleLine(map.name, ("+%d%s"):format(run.level, run.timed and "" or " (not timed)"), 1, 1, 1, cr, cg, cb)
+        else
+            GameTooltip:AddDoubleLine(map.name, "-", 0.6, 0.6, 0.6, 0.6, 0.6, 0.6)
+        end
+    end
+    GameTooltip:Show()
+end
+
+-- Hovering a dungeon at the top: everyone's best key in that dungeon. The column under the
+-- mouse is followed while it moves along the header.
+function PG.MapsTooltip(line)
+    local maps = PG.MapList()
+    local function Show(idx)
+        GameTooltip:SetOwner(line, "ANCHOR_RIGHT")
+        local map = idx and maps[idx]
+        if not map then
+            GameTooltip:SetText("Dungeons")
+            for _, mp in ipairs(maps) do
+                GameTooltip:AddDoubleLine(mp.short, mp.name, 1, 0.82, 0, 1, 1, 1)
+            end
+            GameTooltip:Show()
+            return
+        end
+        GameTooltip:SetText(map.name)
+        local rows = {}
+        for _, m in ipairs(PG.mplusMembers or {}) do
+            rows[#rows + 1] = { m = m, run = m.mruns and m.mruns[map.id] }
+        end
+        table.sort(rows, function(a, b)
+            local la, lb = a.run and a.run.level or 0, b.run and b.run.level or 0
+            if la ~= lb then return la > lb end
+            return a.m.name < b.m.name
+        end)
+        for _, row in ipairs(rows) do
+            local c = RAID_CLASS_COLORS and RAID_CLASS_COLORS[row.m.class]
+            local label = row.m.name .. (row.m.left and "  (left)" or "")
+            if row.run then
+                local cr, cg, cb = PG.KeyColor(row.run)
+                GameTooltip:AddDoubleLine(label, ("+%d%s"):format(row.run.level, row.run.timed and "" or " (not timed)"),
+                    c and c.r or 1, c and c.g or 1, c and c.b or 1, cr, cg, cb)
+            else
+                GameTooltip:AddDoubleLine(label, "-", c and c.r or 1, c and c.g or 1, c and c.b or 1, 0.6, 0.6, 0.6)
+            end
+        end
+        GameTooltip:Show()
+    end
+
+    local last = -1
+    local cw = line.cw
+    local function Update()
+        local idx
+        local left = line:GetLeft()
+        if cw and left then
+            local x = GetCursorPosition() / line:GetEffectiveScale()
+            idx = math.floor((x - left - MP_COL0) / cw) + 1
+            if idx < 1 or idx > #maps then idx = nil end
+        end
+        if (idx or 0) ~= last then
+            last = idx or 0
+            Show(idx)
+            -- the column under the mouse is lit, from the header to the bottom of the list
+            local hl = PG.colHl
+            if not hl then
+                hl = overview.child:CreateTexture(nil, "BACKGROUND", nil, 3)
+                hl:SetColorTexture(1, 0.82, 0, 0.16)
+                PG.colHl = hl
+            end
+            if idx and cw then
+                hl:ClearAllPoints()
+                hl:SetPoint("TOPLEFT", overview.child, "TOPLEFT", MP_COL0 + (idx - 1) * cw, 0)
+                hl:SetPoint("BOTTOMLEFT", overview.child, "BOTTOMLEFT", MP_COL0 + (idx - 1) * cw, 0)
+                hl:SetWidth(cw)
+                hl:Show()
+            else
+                hl:Hide()
+            end
+        end
+    end
+    line:SetScript("OnUpdate", Update)
+    Update()
+end
+
+-- the cells of one line (one per dungeon), created as needed
+function PG.Cells(l, n)
+    l.cells = l.cells or {}
+    local cw = (OVERVIEW_W - MP_COL0) / math.max(n, 1)        -- the last column ends at the edge
+    l.cw = cw
+    l.shade = l.shade or {}
+    for i = 1, n do
+        -- every other column is shaded, so a key level can be followed up to its dungeon
+        local sh = l.shade[i]
+        if not sh then
+            sh = l:CreateTexture(nil, "BACKGROUND", nil, 2)
+            l.shade[i] = sh
+        end
+        sh:ClearAllPoints()
+        sh:SetPoint("TOPLEFT", l, "TOPLEFT", MP_COL0 + (i - 1) * cw, 0)
+        sh:SetPoint("BOTTOMLEFT", l, "BOTTOMLEFT", MP_COL0 + (i - 1) * cw, 0)
+        sh:SetWidth(cw)
+        sh:SetColorTexture(1, 1, 1, 0.07)
+        sh:SetShown(i % 2 == 0)
+        local c = l.cells[i]
+        if not c then
+            c = l:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            c:SetJustifyH("CENTER")
+            l.cells[i] = c
+        end
+        c:SetWidth(cw)
+        c:ClearAllPoints()
+        c:SetPoint("LEFT", l, "LEFT", MP_COL0 + (i - 1) * cw, 0)
+        c:Show()
+    end
+    for i = n + 1, #l.cells do l.cells[i]:Hide() end
+    for i = n + 1, #l.shade do l.shade[i]:Hide() end
+    return l.cells
+end
 
 local function OverviewLine(i)
     local l = overview.lines[i]
@@ -4265,11 +4514,11 @@ local function OverviewLine(i)
     l.role:SetPoint("LEFT", 4, 0)
     l.name = l:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     l.name:SetPoint("LEFT", 22, 0)
-    l.name:SetWidth(120)
+    l.name:SetWidth(140)
     l.name:SetJustifyH("LEFT")
     l.class = l:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    l.class:SetPoint("LEFT", 146, 0)
-    l.class:SetWidth(90)
+    l.class:SetPoint("LEFT", 170, 0)
+    l.class:SetWidth(110)
     l.class:SetJustifyH("LEFT")
     l.ilvl = l:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     l.ilvl:SetPoint("RIGHT", -6, 0)
@@ -4301,9 +4550,16 @@ local function OverviewLine(i)
         if not ok then print("|cff33ff99BF:|r couldn't inspect:", err) end
     end)
     l:SetScript("OnEnter", function(self)
-        if self.prog then pcall(PG.Tooltip, self) elseif self.parse then pcall(PG.ParseTooltip, self) end
+        if self.prog then pcall(PG.Tooltip, self)
+        elseif self.parse then pcall(PG.ParseTooltip, self)
+        elseif self.mplus then pcall(PG.MPlusTooltip, self)
+        elseif self.mapsTip then pcall(PG.MapsTooltip, self) end
     end)
-    l:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    l:SetScript("OnLeave", function(self)
+        self:SetScript("OnUpdate", nil)
+        if PG.colHl then PG.colHl:Hide() end
+        GameTooltip:Hide()
+    end)
     l.sub = l:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     l.sub:SetJustifyH("LEFT")
     l.sub:SetTextColor(0.6, 0.6, 0.6)
@@ -4314,7 +4570,9 @@ end
 local function RefreshOverview()
     if not (overview and overview:IsShown()) then return end
     local mode = db.overviewMode
-    if mode == "parse" and not PG.ParseAvailable() then mode = "ilvl" end
+    if not PG.ModeOk(mode) then mode = "ilvl" end
+    if PG.colHl then PG.colHl:Hide() end
+    PG.LayoutModes()
     for _, b in ipairs(overview.modeButtons) do
         b:SetState(b.key == mode and "sel" or "off", b.label)
     end
@@ -4335,6 +4593,7 @@ local function RefreshOverview()
     local progRaid, progData
     if mode == "prog" then progRaid, progData = PG.Prepare(members) end
     if mode == "parse" then PG.ParsePrepare(members) end
+    if mode == "mplus" then PG.MPlusPrepare(members) end
     local groups = BuildOverviewGroups(members, mode)
 
     -- the raid picker only belongs to the Progress view
@@ -4364,7 +4623,10 @@ local function RefreshOverview()
         l.head:SetWordWrap(false)
         l.sub:Hide()
         l.head:SetFontObject("GameFontNormal")
-        l.unit, l.guid, l.prog, l.parse, l.leftKey = nil, nil, nil, nil, nil
+        l.unit, l.guid, l.prog, l.parse, l.leftKey, l.mplus, l.mapsTip = nil, nil, nil, nil, nil, nil, nil
+        if l.cells then for _, c in ipairs(l.cells) do c:Hide() end end
+        if l.shade then for _, t in ipairs(l.shade) do t:Hide() end end
+        l:SetScript("OnUpdate", nil)
         l.hl:SetShown(false)
         l.ilvl:ClearAllPoints()
         l.ilvl:SetPoint("RIGHT", -6, 0)
@@ -4389,6 +4651,27 @@ local function RefreshOverview()
                 .. (known < present and ("  |cff999999(%d/%d known)|r"):format(known, present) or ""))
         else
             l.head:SetText("Average item level: |cffffd100?|r")
+        end
+    end
+
+    -- M+ view: the dungeons' short names head the columns
+    if mode == "mplus" then
+        local l = Next(20)
+        l.bg:SetColorTexture(1, 1, 1, 0.05)
+        l.role:Hide(); l.name:Hide(); l.class:Hide(); l.ilvl:Hide(); l.head:Hide()
+        l.mapsTip = true
+        l.hl:SetShown(false)             -- the column is lit instead of the line
+        local maps = PG.MapList()
+        local cells = PG.Cells(l, #maps)
+        for i, map in ipairs(maps) do
+            cells[i]:SetTextColor(1, 0.82, 0)
+            cells[i]:SetText(map.short)
+        end
+        -- a refresh while the mouse is on the header: carry on following it
+        if l:IsMouseOver() then pcall(PG.MapsTooltip, l) end
+        if #maps == 0 then
+            l.head:Show(); l.head:SetTextColor(0.8, 0.8, 0.8)
+            l.head:SetText("Dungeon list not loaded yet")
         end
     end
 
@@ -4428,6 +4711,7 @@ local function RefreshOverview()
             r.role:SetAtlas(ROLE_ATLAS[m.role]); r.role:Show()
             local c2 = RAID_CLASS_COLORS and RAID_CLASS_COLORS[m.class]
             r.name:SetTextColor(c2 and c2.r or 1, c2 and c2.g or 1, c2 and c2.b or 1)
+            r.name:SetWidth(mode == "mplus" and (MP_COL0 - 26) or 140)
             r.name:SetText(m.name); r.name:Show()
             r.class:SetTextColor(0.65, 0.65, 0.65)
             r.class:SetText(m.spec or ClassName(m.class)); r.class:Show()
@@ -4444,6 +4728,35 @@ local function RefreshOverview()
                 r.ilvl:SetText(m.ilvl and ("%d"):format(math.floor(m.ilvl + 0.5)) or "?")
             end
             r.ilvl:Show()
+            if mode == "mplus" then
+                r.mplus = m
+                if m.left then
+                    r.ilvl:Hide()
+                else
+                    r.class:Hide(); r.ilvl:Hide()
+                    local maps = PG.MapList()
+                    local cells = PG.Cells(r, #maps)
+                    for i, map in ipairs(maps) do
+                        local run = m.mruns and m.mruns[map.id]
+                        if run then
+                            local color
+                            if run.timed and C_ChallengeMode and C_ChallengeMode.GetKeystoneLevelRarityColor then
+                                local ok, c = pcall(C_ChallengeMode.GetKeystoneLevelRarityColor, run.level)
+                                if ok and c and c.r then color = c end
+                            end
+                            if run.timed then
+                                cells[i]:SetTextColor(color and color.r or 1, color and color.g or 1, color and color.b or 1)
+                            else
+                                cells[i]:SetTextColor(0.55, 0.55, 0.55)
+                            end
+                            cells[i]:SetText(tostring(run.level))
+                        else
+                            cells[i]:SetTextColor(0.4, 0.4, 0.4)
+                            cells[i]:SetText("-")
+                        end
+                    end
+                end
+            end
             if m.left then
                 r.bg:SetColorTexture(0.85, 0.15, 0.15, 0.28)
                 r.class:SetTextColor(1, 0.45, 0.45)
