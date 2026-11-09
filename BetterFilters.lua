@@ -2252,16 +2252,191 @@ local function UpdateNotesButton()
     for _ in pairs(db.notes) do n = n + 1 end
     local label = n > 0 and ("Notes (" .. n .. ")") or "Notes"
     for _, button in ipairs(notesButtons) do
-        -- green while the notes panel is open next to this button's panel
-        local open = notesPanel and notesPanel:IsShown() and notesPanel:GetParent() == button.ownerPanel
+        -- green while the notes panel is open
+        local open = notesPanel and notesPanel:IsShown()
         button:SetState(open and "yes" or "off", label)
     end
 end
 
+-- Sharing notes ---------------------------------------------------------------------
+-- All your notes go to your group through addon messages. Each member who has the addon
+-- gets a prompt, and if they accept, the notes are added (a player they already have a
+-- note on keeps their own note).
+local NS = { PREFIX = "BFNOTES", inbox = {}, queue = {} }
+local MAX_SHARED, CHUNK = 200, 190
+
+-- text -> plain ASCII, so messages can be cut anywhere and joined again
+local function Enc(str)
+    return (tostring(str):gsub("[%%|%c\128-\255]", function(c) return ("%%%02X"):format(c:byte()) end))
+end
+local function Dec(str)
+    return (str:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
+end
+
+function NS.Channel()
+    if IsInRaid() then return "RAID" end
+    if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then return "INSTANCE_CHAT" end
+    if IsInGroup() then return "PARTY" end
+end
+
+function NS.Say(text) print("|cff33ff99BF:|r " .. text) end
+
+-- one message per tick, so a long list is not throttled away
+function NS.Pump()
+    if NS.ticker then return end
+    NS.ticker = C_Timer.NewTicker(0.2, function()
+        local item = NS.queue[1]
+        if not item then
+            NS.ticker:Cancel(); NS.ticker = nil
+            return
+        end
+        local ok, res = pcall(C_ChatInfo.SendAddonMessage, NS.PREFIX, item.text, item.channel)
+        local success = Enum and Enum.SendAddonMessageResult and Enum.SendAddonMessageResult.Success
+        if ok and (res == nil or res == true or res == success) then
+            table.remove(NS.queue, 1)
+            if #NS.queue == 0 then NS.Say(("Shared %d notes with your group."):format(NS.sentCount or 0)) end
+        else
+            local throttle = Enum and Enum.SendAddonMessageResult and Enum.SendAddonMessageResult.AddonMessageThrottle
+            item.tries = (item.tries or 0) + 1
+            if res ~= throttle or item.tries > 25 then      -- a real failure, or throttled for too long
+                wipe(NS.queue)
+                NS.Say("Sharing stopped: the game would not send the notes right now.")
+            end
+        end
+    end)
+end
+
+function NS.Share()
+    local channel = NS.Channel()
+    if not channel then NS.Say("You are not in a group, so there is nobody to share with.") return end
+    local list = {}
+    for key, note in pairs(db.notes) do
+        if #list >= MAX_SHARED then break end
+        list[#list + 1] = Enc(key) .. "|" .. Enc(note.color or "") .. "|" .. Enc(note.text or "")
+    end
+    if #list == 0 then NS.Say("You have no notes to share.") return end
+    if #NS.queue > 0 then NS.Say("Still sending, one moment.") return end
+    local batch = ("%x"):format(math.random(0x1000, 0xFFFFFF))
+    NS.queue[#NS.queue + 1] = { channel = channel, text = ("B|%s|%d"):format(batch, #list) }
+    for i, rec in ipairs(list) do
+        local parts = math.ceil(#rec / CHUNK)
+        for part = 1, parts do
+            NS.queue[#NS.queue + 1] = {
+                channel = channel,
+                text = ("R|%s|%d|%d|%d|%s"):format(batch, i, part, parts, rec:sub((part - 1) * CHUNK + 1, part * CHUNK)),
+            }
+        end
+    end
+    NS.sentCount = #list
+    NS.Pump()
+end
+
+-- the notes in a finished batch are added when the player accepts
+function NS.Import(data)
+    local added, kept = 0, 0
+    for _, rec in ipairs(data.records) do
+        local key = NormalizeName(rec.key)
+        if key and key:find("-", 1, true) then
+            if db.notes[key] then
+                kept = kept + 1                      -- you already have a note on them: yours stays
+            else
+                local color = NOTE_COLORS[rec.color] and rec.color or "green"
+                db.notes[key] = { color = color, text = strtrim((rec.text or ""):sub(1, 120)) }
+                added = added + 1
+            end
+        end
+    end
+    NotesChanged()
+    NS.Say(("Added %d notes from %s%s."):format(added, data.sender,
+        kept > 0 and (" (kept your own note on %d players)"):format(kept) or ""))
+end
+
+StaticPopupDialogs["BETTERFILTERS_SHARE_NOTES"] = {
+    text = "%s wants to share %s notes with you. Add them to your notes?\n\n(Players you already have a note on are left as they are.)",
+    button1 = "Add",
+    button2 = "Decline",
+    OnAccept = function(self, data) if data then pcall(NS.Import, data) end end,
+    timeout = 0,
+    whileDead = true,
+    hideOnEscape = true,
+    preferredIndex = 3,
+}
+
+function NS.OnMessage(text, channel, sender)
+    if not (usable(text) and usable(sender) and type(text) == "string" and type(sender) == "string") then return end
+    if channel ~= "PARTY" and channel ~= "RAID" and channel ~= "INSTANCE_CHAT" then return end
+    local who = Ambiguate(sender, "none")
+    if UnitIsUnit(who, "player") then return end
+    local kind, batch, rest = text:match("^(%a)|(%x+)|(.*)$")
+    if not kind then return end
+    local id = who .. ":" .. batch
+    local now = GetTime()
+    for k, v in pairs(NS.inbox) do          -- forget batches that never finished
+        if now - v.time > 120 then NS.inbox[k] = nil end
+    end
+    if kind == "B" then
+        local count = tonumber(rest)
+        if count and count > 0 and count <= MAX_SHARED then
+            NS.inbox[id] = { sender = who, count = count, recs = {}, done = 0, time = now }
+        end
+    elseif kind == "R" then
+        local box = NS.inbox[id]
+        if not box then return end
+        local idx, part, parts, payload = rest:match("^(%d+)|(%d+)|(%d+)|(.*)$")
+        idx, part, parts = tonumber(idx), tonumber(part), tonumber(parts)
+        if not (idx and part and parts) or idx < 1 or idx > box.count or parts < 1 or parts > 20 then return end
+        local rec = box.recs[idx]
+        if not rec then rec = { parts = {}, got = 0, total = parts }; box.recs[idx] = rec end
+        if not rec.parts[part] then rec.parts[part] = payload; rec.got = rec.got + 1 end
+        if rec.got == rec.total and not rec.finished then
+            rec.finished = true
+            box.done = box.done + 1
+            if box.done == box.count then
+                NS.inbox[id] = nil
+                local records = {}
+                for i = 1, box.count do
+                    local r = box.recs[i]
+                    local joined = table.concat(r.parts, "", 1, r.total)
+                    local k, c, t = joined:match("^([^|]*)|([^|]*)|([^|]*)$")
+                    if k then records[#records + 1] = { key = Dec(k), color = Dec(c), text = Dec(t) } end
+                end
+                if #records > 0 then
+                    StaticPopup_Show("BETTERFILTERS_SHARE_NOTES", box.sender, tostring(#records), { sender = box.sender, records = records })
+                end
+            end
+        end
+    end
+end
+
+do
+    if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then C_ChatInfo.RegisterAddonMessagePrefix(NS.PREFIX) end
+    local f = CreateFrame("Frame")
+    f:RegisterEvent("CHAT_MSG_ADDON")
+    f:SetScript("OnEvent", function(_, _, prefix, text, channel, sender)
+        if prefix == NS.PREFIX then pcall(NS.OnMessage, text, channel, sender) end
+    end)
+end
+
 local function CreateNotesPanel()
-    local p = CreateFrame("Frame", "BetterFiltersNotesPanel", panel)
+    -- free floating like the Group Overview: drag it anywhere, close it with the x or Escape
+    local p = CreateFrame("Frame", "BetterFiltersNotesPanel", UIParent)
     p:SetSize(280, 70 + NOTES_VISIBLE * (NOTES_ROW_H + NOTES_ROW_GAP) + 18)
-    p:SetPoint("TOPLEFT", panel, "TOPRIGHT", 4, 0)
+    p:SetPoint("CENTER", UIParent, "CENTER", 0, 0)       -- set properly when first opened
+    p:SetFrameStrata("DIALOG")
+    p:SetMovable(true)
+    p:SetClampedToScreen(true)
+    p:RegisterForDrag("LeftButton")
+    p:SetScript("OnDragStart", p.StartMoving)
+    p:SetScript("OnDragStop", function(self)
+        self:StopMovingOrSizing()
+        local left, top = self:GetLeft(), self:GetTop()
+        if left and top then
+            self:ClearAllPoints()
+            self:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", left, top)
+        end
+    end)
+    p:Hide()
+    tinsert(UISpecialFrames, "BetterFiltersNotesPanel")
     p:EnableMouse(true)
     p:EnableMouseWheel(true)
     p.offset = 0
@@ -2279,6 +2454,48 @@ local function CreateNotesPanel()
     local title = p:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     title:SetPoint("TOP", p, "TOP", 0, -9)
     title:SetText("Notes")
+
+    local close = MakeToggleButton(p, 0, 0, 20)
+    close:SetHeight(18)
+    close:ClearAllPoints()
+    close:SetPoint("TOPRIGHT", p, "TOPRIGHT", -8, -8)
+    close:SetState("no", "x")
+    close:SetScript("OnClick", function() p:Hide() end)
+
+    -- share: sends your notes to the group, each member gets a prompt to add them
+    local share = MakeToggleButton(p, 0, 0, 24)
+    share:SetHeight(18)
+    share:ClearAllPoints()
+    share:SetPoint("TOPLEFT", p, "TOPLEFT", 8, -8)
+    share:SetState("off", "")
+    -- the usual "share" glyph: three dots joined by two lines
+    do
+        local function Dot(x, y)
+            local t = share:CreateTexture(nil, "OVERLAY")
+            t:SetSize(4, 4)
+            t:SetPoint("CENTER", share, "CENTER", x, y)
+            t:SetColorTexture(1, 0.82, 0)
+        end
+        local function Line(angle, y)
+            local t = share:CreateTexture(nil, "OVERLAY")
+            t:SetSize(11, 1.5)
+            t:SetPoint("CENTER", share, "CENTER", 0, y)
+            t:SetColorTexture(1, 0.82, 0)
+            t:SetRotation(angle)
+        end
+        Line(math.rad(24), 2.25)
+        Line(math.rad(-24), -2.25)
+        Dot(-5, 0); Dot(5, 4.5); Dot(5, -4.5)
+    end
+    share:SetScript("OnClick", function() NS.Share() end)
+    share:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+        GameTooltip:SetText("Share notes")
+        GameTooltip:AddLine("Sends all your notes to your group. Each member who has Better Filters gets a prompt to add them.", 1, 1, 1, true)
+        if not NS.Channel() then GameTooltip:AddLine("You are not in a group.", 1, 0.4, 0.4) end
+        GameTooltip:Show()
+    end)
+    share:SetScript("OnLeave", GameTooltip_Hide)
 
     local divider = p:CreateTexture(nil, "ARTWORK")
     divider:SetColorTexture(unpack(THEME.border))
@@ -2417,20 +2634,25 @@ RefreshNotesPanel = function()
     p.hint:SetShown(#list > NOTES_VISIBLE)
 end
 
--- The notes panel opens next to whichever filter panel asked for it.
+-- The notes panel floats on its own. The first time it opens it sits beside the filter
+-- panel that asked for it; after that it stays wherever you left it.
 local function ToggleNotesPanel(anchor)
     anchor = anchor or panel
     if not notesPanel then notesPanel = CreateNotesPanel() end
 
-    if notesPanel:GetParent() ~= anchor then
-        -- it was next to the other panel: move it here and show it
+    if notesPanel:IsShown() then
         notesPanel:Hide()
-        notesPanel:SetParent(anchor)
-        notesPanel:ClearAllPoints()
-        notesPanel:SetPoint("TOPLEFT", anchor, "TOPRIGHT", 4, 0)
-        notesPanel:Show()
     else
-        notesPanel:SetShown(not notesPanel:IsShown())
+        if not notesPanel.placed then
+            notesPanel.placed = true
+            local right, top = anchor:GetRight(), anchor:GetTop()
+            if right and top then
+                local k = anchor:GetEffectiveScale() / UIParent:GetEffectiveScale()
+                notesPanel:ClearAllPoints()
+                notesPanel:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", right * k + 4, top * k)
+            end
+        end
+        notesPanel:Show()
     end
     UpdateNotesButton()
 end
